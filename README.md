@@ -29,7 +29,13 @@ cargo build --release
 
 The defaults are chosen to reproduce the book's picture on a laptop: 2048 x
 1280 cells, a plate 173 cells across, Reynolds number near 100. That is 2.6
-million cells in about 8 MB, and a few minutes of wall time.
+million cells in about 8 MB, and about three seconds on an M3 Pro.
+
+On macOS the update runs on the GPU by default, as bitplanes -- one bit per
+cell per direction, 32 cells to a word, so a collision is Boolean algebra
+evaluated on 32 cells at once. `--no-gpu` runs the byte-per-cell CPU kernel
+instead, which is the reference implementation and about thirty times slower.
+The header line says which one is running.
 
 Each frame is written twice: `vorticity-NNNN.png`, a colour map of the
 vorticity (blue and red for the two senses of rotation), and
@@ -79,6 +85,11 @@ The program measures both instead of quoting them:
 ```bash
 ./target/release/lgca --measure
 ```
+
+This runs on whichever backend the simulation will, so the coefficients
+reported are the ones the running code actually has. The two agree: `nu` 0.2989
+on the CPU against 0.3080 on the GPU, `g` 0.4405 against 0.4361, both inside
+the spread of the estimator across seeds.
 
 * **Viscosity** comes from a shear wave seeded in a periodic box, whose
   amplitude decays as `exp(-nu k^2 t)`.
@@ -152,6 +163,20 @@ number on about a sixth as many cells.
   without stationary particles.
 * The PNG writer's deflate output round-trips through a matching decoder.
 
+The GPU path is a second implementation of the same rules, so it gets its own
+layer of checks. Its collision circuit is not hand-written: it is emitted at
+startup from the same enumeration of momentum classes the CPU lookup table is
+built from, and a test runs the shader that ships over every state and every
+draw to confirm it agrees with that enumeration. Propagation, walls, the
+inflow boundary and the coarse-graining are each checked against the CPU
+version. Two `#[ignore]`d tests then ask the question that matters -- whether it
+is the same *fluid* -- by measuring viscosity and the advection factor on both
+paths through an identical protocol from identical initial cells:
+
+```bash
+cargo test --release --lib -- --ignored --nocapture
+```
+
 `tests/golden.rs` adds the checks that matter when optimising rather than when
 writing: that a fixed run still produces the same lattice bit for bit, that it
 produces the same answer twice running, and that mass and momentum come out
@@ -169,8 +194,8 @@ for a plate held across the flow at this Reynolds number.
 `cargo bench` runs the benchmark suite in `benches/speed.rs` and reports the
 change against the numbers recorded in `benches/baseline.txt`. The cases cover
 the update kernel at both cache-resident and production sizes, threaded and
-not, the coarse-graining and analysis passes, the PNG and SVG writers, and the
-startup viscosity measurement. [BENCHMARKS.md](BENCHMARKS.md) has the recorded
+not, on the CPU and on the GPU, the coarse-graining and analysis passes on
+both, the PNG and SVG writers, and the startup viscosity measurement. [BENCHMARKS.md](BENCHMARKS.md) has the recorded
 figures, what each case is for, and where the time in a default run actually
 goes -- which is not where one would guess.
 
@@ -182,5 +207,7 @@ goes -- which is not where one would guess.
   status line reports the realised values.
 * Row count must be even, so the lattice wraps cleanly in y.
 * The top and bottom edges are periodic, not walls.
-* No dependencies: the PNG writer, the random number generator and the thread
-  pool are all in-tree.
+* No dependencies: the PNG writer, the random number generator, the thread pool
+  and the Metal binding are all in-tree. `Cargo.lock` lists one package.
+* The two paths do not produce the same lattice: they draw from different
+  random streams, so they agree on the fluid and not on the microstate.

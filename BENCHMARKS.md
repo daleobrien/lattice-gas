@@ -71,34 +71,38 @@ what it is -- a busy machine -- rather than being folded into the result.
 The point of the suite is not the individual numbers but the budget they add
 up to. For the default run -- 2048x1280 cells, 6,000 warmup steps then 40,000
 recorded ones, a field sample every 5 steps, a frame every 500 -- the measured
-per-call costs predict about 1.4 minutes of wall time, spent like this:
+per-call costs predict this, and the binary takes 3.1 s against the 3.4 s
+predicted:
 
 | Phase | Calls | Each | Total | Share |
 | --- | ---: | ---: | ---: | ---: |
-| `Lattice::step` | 46,000 | 1.62 ms | 74 s | **91%** |
-| `transport::measure` at startup | 1 | 5.4 s | 5.4 s | 7% |
-| `Field::sample` | 8,001 | 0.19 ms | 1.5 s | 2% |
-| Writing frames (PNG + SVG) | 80 | 9.8 ms | 0.8 s | 1% |
+| `GpuLattice::advance_sampling` | 46,000 | 0.048 ms | 2.2 s | **65%** |
+| Writing frames (PNG + SVG) | 80 | 9.6 ms | 0.8 s | 22% |
+| `transport::measure` at startup | 1 | 0.7 s | 0.7 s | 20% |
 | `init_equilibrium` | 1 | 17 ms | 0.02 s | <1% |
 
-The step figure is `step/2048x1280/tN` plus the inlet re-seed, which that case
-leaves out and a real run pays on every step. A 5,000-step run of the binary
-takes 8.5 s against the 8.3 s this predicts, so the model is close enough to
-plan against. (`transport::measure` runs before the binary starts its own
-clock, so it is not part of that 8.5 s.)
+The step figure is `step/gpu/2048x1280/batched+inlet+sample`, which is the
+production configuration: the inflow boundary and a field sample every fifth
+step, both on the GPU, batched so the program synchronises once a frame rather
+than once a sample.
 
-This table used to read the other way round: **coarse-graining cost twice as
-much as simulating**, because `Field::sample` walked all 2.6M cells on one
-thread, unpacking six direction bits per cell into `f32` adds, while
-`Lattice::step` -- which does strictly more work per cell -- spread itself over
-all twelve cores. It now looks the cell byte up in a table of packed integer
-moments (`src/moments.rs`) and shares the block rows out over the same threads
-the update uses, which took it from 22.6 ms to 0.19 ms.
+On `--no-gpu` the same table reads 74 s for `Lattice::step`, 1.5 s for
+`Field::sample` and 6.1 s for the startup measurement, and the run takes 1.4
+minutes -- which is where this table stood one phase ago, when it said **the
+update is 91% of the run**.
+
+And a phase before that it read the other way round again: **coarse-graining
+cost twice as much as simulating**, because `Field::sample` walked all 2.6M
+cells on one thread, unpacking six direction bits per cell into `f32` adds,
+while `Lattice::step` -- which does strictly more work per cell -- spread itself
+over all twelve cores. It now looks the cell byte up in a table of packed
+integer moments (`src/moments.rs`) and shares the block rows out over the same
+threads the update uses, which took it from 22.6 ms to 0.18 ms.
 `Lattice::mean_velocity` had the same shape and the same fix, 23.1 ms to
 0.51 ms.
 
-So **the update is now 91% of the run**, and that is where the next round of
-work belongs. `PLAN.md` says what it looks like.
+So the run is no longer dominated by any one thing, which is the point at which
+to stop. `PLAN.md` has the history.
 
 ## What each case is for
 
@@ -119,10 +123,34 @@ in the program that has to be fast.
 * `tN/inlet`: the inlet re-seed is serial, so the gap to plain `512x512/tN`
   (185 -> 224 us) is the cost of the one part of `step` that does not scale.
   Those 39 us are for 512 rows; a full-height run pays about 95 us per step,
-  which is small against today's update and would not be against a faster one.
+  which is small against the CPU update and is not small against the GPU one.
+
+**`step/gpu/*`** -- the same update on the GPU, as bitplanes. The four cases
+are cumulative, and the gaps between them are the interesting part:
+
+* `one-per-submit` vs `batched`: 0.171 ms against 0.032, the same hundred steps
+  submitted one command buffer each and all in one. A round trip costs more
+  than five steps do, which is the constraint the whole GPU path is built
+  around -- it is why coarse-graining had to become a kernel too.
+* `batched+inlet`: 0.046 ms. The inflow boundary is its own dispatch, and costs
+  0.013 ms a step almost regardless of how wide it is, because what is being
+  paid for is the second dispatch rather than the work. `PLAN.md` has the
+  measurements behind that choice; folding it into the step kernel instead cost
+  0.025 ms.
+* `batched+inlet+sample`: 0.048 ms, the production configuration. Twenty field
+  samples across the hundred steps add 0.0025 ms a step, so coarse-graining has
+  gone from twice the cost of simulating to five percent of it.
+
+**`field/gpu/sample`, `lattice/gpu/total-particles`** -- the analysis passes on
+the device, timed on their own and so paying a full round trip each: about 0.14
+and 0.17 ms against a floor of 0.09 ms for an empty submit. Inside a batch the
+sample costs 0.0025 ms. These two cases measure the synchronisation, which is
+what makes them worth having -- they are the reason the run loop hands a whole
+frame's worth of steps to `advance_sampling` rather than calling it per sample.
 
 **`field/*`, `lattice/mean-velocity`, `lattice/total-particles`** -- the
-analysis passes, all three of which now read the cell array a word at a time.
+CPU analysis passes, all three of which now read the cell array a word at a
+time.
 `total_particles` popcounts eight cells per instruction and manages 57.8
 Gcell/s; `Field::sample` and `Lattice::mean_velocity` look each cell byte up in
 the packed-moment tables in `src/moments.rs` and reach 13.6 and 5.2 Gcell/s.

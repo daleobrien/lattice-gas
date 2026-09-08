@@ -502,6 +502,49 @@ fn main() {
                 build(100),
                 |(g, n)| g.advance(*n),
             );
+            // The two things a real run adds to a bare step: the inflow
+            // boundary, which is folded into the step kernel, and a field
+            // sample every fifth step. Both are meant to disappear into the
+            // step; these two cases are how that claim gets checked.
+            r.bench(
+                "step/gpu/2048x1280/batched+inlet",
+                cells(bw * bh * 100),
+                || {
+                    let (mut g, n) = build(100)();
+                    g.set_inlet(8, DENSITY, (SPEED, 0.0), true);
+                    (g, n)
+                },
+                |(g, n)| g.advance(*n),
+            );
+            r.bench(
+                "step/gpu/2048x1280/batched+inlet+sample",
+                cells(bw * bh * 100),
+                || {
+                    let (mut g, n) = build(100)();
+                    g.set_inlet(8, DENSITY, (SPEED, 0.0), true);
+                    g.attach_field(BLOCK, BLOCK);
+                    (g, n)
+                },
+                |(g, n)| g.advance_sampling(*n, 5, 0.2),
+            );
+            r.bench(
+                "field/gpu/sample/2048x1280",
+                cells(bw * bh),
+                || {
+                    let (mut g, _) = build(1)();
+                    g.attach_field(BLOCK, BLOCK);
+                    g
+                },
+                |g| g.sample_field(0.2),
+            );
+            r.bench(
+                "lattice/gpu/total-particles/2048x1280",
+                cells(bw * bh),
+                || build(1)().0,
+                |g| {
+                    black_box(g.total_particles());
+                },
+            );
         }
     }
 
@@ -587,14 +630,14 @@ fn main() {
         "transport/measure/64",
         None,
         || (),
-        |_| transport::measure(DENSITY, true, nth, SEED, 64),
+        |_| transport::measure(DENSITY, true, nth, SEED, 64, false),
     );
     if slow {
         r.bench(
             "transport/measure/256",
             None,
             || (),
-            |_| transport::measure(DENSITY, true, nth, SEED, 256),
+            |_| transport::measure(DENSITY, true, nth, SEED, 256, false),
         );
     }
 

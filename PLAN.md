@@ -193,7 +193,7 @@ and compute is precisely where the shared memory controller stops mattering.
 **Effect on the default run: CPU bitplane takes ~1.4 min to ~25 s (3.3x).
 Going to Metal with the same rule takes it to ~4 s (about 20x).**
 
-## Phase 3 --- Metal --- in progress
+## Phase 3 --- Metal --- done
 
 Promoted ahead of the CPU bitplane rewrite on the strength of the measurement
 above: same rule, 3.4x on twelve cores against 45x on the GPU.
@@ -260,23 +260,73 @@ plentiful enough to mean anything. Both sit a little above the 0.2989
 adaptively and this uses a fixed one; the comparison is between two numbers
 measured the same way.
 
-The test is `#[ignore]`d, since it steps the CPU path twenty thousand times and
-takes about seven seconds:
+The advection factor is the other half, and the sharper half:
+
+    cpu g = 0.4392, gpu g = 0.4373 --- 0.4% apart
+
+Over four independent estimates that fit has a spread of 0.24% on the CPU and
+0.11% on the GPU, against 4% and 8% for the viscosity, so its tolerance can be
+3% rather than 12%. A phase that turns steadily is simply a cleaner thing to
+measure than an amplitude decaying into the lattice's own noise --- and `g` is
+the coefficient the Reynolds number is proportional to, so this is the test
+that would catch the fluid changing.
+
+Both are `#[ignore]`d, since they step the CPU path tens of thousands of times:
 
 ```bash
-cargo test --release --lib -- --ignored --nocapture viscosity
+cargo test --release --lib -- --ignored --nocapture
 ```
 
-### Still to do
+### Wired in
 
-* Coarse-graining as a GPU kernel, so a frame does not force a round trip every
-  fifth step. At 0.0345 ms a step, syncing every fifth one would cost more than
-  the steps do.
-* The inlet re-seed, which is 44% of a step at this speed if it stays on the CPU.
-* The advection factor `g`, the other half of the acceptance test, measured the
-  same way as the viscosity above.
-* Wiring into `main.rs` and `transport::measure`, with the CPU path kept as the
-  reference the golden tests run against.
+The 43x above was a benchmark number: it measured a bare step, and the binary
+still ran on the CPU. Four things closed that gap.
+
+* **Coarse-graining is a GPU kernel** (`lgca_sample`), one thread per display
+  block, and the running time average lives in device memory. That is what
+  keeps the batching: the program synchronises once a frame rather than once a
+  sample, and 100 steps with 20 samples folded in cost 4.819 ms against 4.565
+  for the steps alone --- 0.0025 ms a sample.
+* **The inflow boundary is a GPU kernel** (`lgca_inlet`). See below; this one
+  did not go the way the plan assumed.
+* **`total_particles` is a GPU kernel** (`lgca_count`), so the status line does
+  not force the planes to be unpacked every frame.
+* **`transport::measure` runs on whichever backend the run will use**, through
+  a new `Sim` in [`src/sim.rs`](src/sim.rs) that both it and `main.rs` drive.
+  It was 7% of the old run and would have been 65% of the new one. 6.1 s to
+  0.7 s, and the two agree: `nu` 0.2989 against 0.3080, `g` 0.4405 against
+  0.4361.
+
+`--gpu` is the default where there is a device, `--no-gpu` forces the CPU path,
+and the header line says which one is running. The CPU path is untouched ---
+`tests/golden.rs` still pins it bit for bit --- so it remains the reference.
+
+**A default run is 3.1 s**, against 1.4 minutes after Phase 1 and 4.7 minutes
+before it.
+
+### The inlet, which cost more than it should
+
+The plan budgeted the inflow re-seed at 44% of a GPU step if it stayed on the
+CPU. It went to the GPU, and still costs 29% of one. Both ways of arranging it
+were measured, and both cost overhead rather than work:
+
+| Inflow arrangement | ms/step | cost |
+| --- | ---: | ---: |
+| No inlet at all | 0.0324 | --- |
+| Folded into the step kernel | 0.0577 | +0.0253 |
+| Its own dispatch | 0.0457 | +0.0133 |
+
+The tell is that neither number moves with the size of the inlet: folded in, 1
+column costs the same as 512, because the inlet is one word in sixty-four, so
+one lane of each 32-wide SIMD group does the work while the other thirty-one
+wait --- and half of all groups contain an inlet lane. As its own dispatch, 1
+column again costs the same as 512, because what is being paid for is the
+second dispatch: the GPU drains the step before the small kernel can start.
+
+Breaking the random-draw dependency chain (counter mode rather than a chain of
+`mix`) made the folded version *worse*, 0.0577 rather than 0.0535, because the
+step kernel is already short of registers. The separate dispatch is the
+cheaper of two overheads, not a fix.
 
 ### Notes from building it
 
@@ -309,7 +359,9 @@ a small Objective-C shim or roughly 300 lines of `objc_msgSend` FFI keeps the
 dependency list empty.
 
 **Effect on the default run: ~10 s -> ~3 s (about 90--120x overall)**, at which
-point PNG and SVG encoding and process startup dominate.
+point PNG and SVG encoding and process startup dominate. Measured afterwards:
+3.1 s, and the prediction about where the remaining time goes was right --- 1.9 s
+of stepping, 0.8 s of PNG and SVG, 0.7 s of startup measurement.
 
 ## Not a lever
 
@@ -325,10 +377,17 @@ Measured, and recorded here so the question does not have to be asked again.
   bytes) and the FHP-III table (3,840 bytes) run at the same speed, as
   [`BENCHMARKS.md`](BENCHMARKS.md) already suspected.
 
-## Where to stop
+## Where it ended up
 
-Phase 1 is half a day for 2.8x with no physics risk, so it is worth doing
-whatever else happens. Phase 2 is the one that matters: 4.7 minutes to 10
-seconds is the difference between a run you schedule and a run you watch. Phase
-3 is a genuine week for 3x at the current size, and is worth taking only for the
-larger lattices it makes possible.
+Phase 1 was half a day for 2.8x with no physics risk. Phase 2 was never
+written: measuring its collision circuit is what showed the same rule was worth
+3.4x on twelve cores and 43x on the GPU, so Phase 3 was promoted past it and
+the byte-per-cell CPU kernel kept as the reference implementation instead.
+
+**4.7 minutes to 3.1 seconds, about 90x.** What is left is 1.9 s of stepping,
+0.8 s of PNG and SVG encoding and 0.7 s of startup measurement, which is a
+different program's problem.
+
+The prize the plan named was size rather than speed, and it is still there: at
+8192x5120 the GPU sustains 0.58 ms a step, so the Re ~ 400 regime that needed
+over an hour is now a run you can watch.

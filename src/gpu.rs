@@ -15,8 +15,10 @@
 //! the enumeration for every state and every draw.
 
 use crate::collision;
-use crate::hex::{NDIR, REST_BIT, SOLID_BIT};
+use crate::hex::{NDIR, REST_BIT, SOLID_BIT, SQRT3_2};
+use crate::lattice::Equilibrium;
 use crate::metal::{Buffer, Device, Pipeline};
+use crate::render::Field;
 
 /// Cells per word. `uint` is what an Apple GPU wants to move and operate on.
 const BITS: usize = 32;
@@ -131,8 +133,9 @@ pub fn collide_source(rest_particles: bool) -> String {
     s
 }
 
-/// Everything but the collision: propagation, walls, the draws, and a kernel
-/// that exists only so the tests can check the emitted rule.
+/// Everything but the collision: propagation, walls, the inflow boundary, the
+/// draws, coarse-graining, a particle count, and a kernel that exists only so
+/// the tests can check the emitted rule.
 const KERNELS: &str = r#"
 // A hash with good avalanche, so that neighbouring cells and consecutive steps
 // get uncorrelated draws from a cheap stateless source.
@@ -169,6 +172,24 @@ inline void draws(uint seed, thread uint& s2, thread uint s3[3], thread uint s5[
         s5[4] |= open5 & ~a & ~b &  c;
         open5 &= c & (a | b);
     }
+}
+
+// A word of independent Bernoulli bits, each true with probability t / 2^24.
+//
+// Reading the threshold from its least significant bit upwards, `x` after
+// step j is true with probability equal to the bits consumed so far: an OR
+// with a fresh uniform word adds a half, an AND with one halves what is
+// there. Twenty-four rounds therefore reproduce the CPU's `k < t` on a 24-bit
+// draw exactly, one probability at a time rather than one cell at a time.
+inline uint bernoulli(uint t, thread uint& r) {
+    if (t == 0u) return 0u;
+    if (t >= (1u << 24)) return 0xffffffffu;
+    uint x = 0u;
+    for (uint j = 0; j < 24u; ++j) {
+        r = mix(r);
+        x = ((t >> j) & 1u) ? (r | x) : (r & x);
+    }
+    return x;
 }
 
 // P: 0 wpr, 1 h, 2 seed, 3 lastword, 4 lastbit, 5 tailmask, 6 total
@@ -234,6 +255,129 @@ kernel void lgca_step(device const uint* a     [[buffer(0)]],
     for (uint d = 0; d < 7; ++d) b[d * total + y * wpr + j] = res[d] & mask;
 }
 
+// The inflow boundary: the leftmost columns are redrawn from equilibrium every
+// step, which is what maintains the mean flow.
+//
+// Its own dispatch, one thread per word that actually needs re-seeding, which
+// is the cheaper of two bad options and was measured rather than guessed.
+//
+// Folded into the step it cost 0.019 ms a step, more than half the step
+// itself, and cost exactly the same for an inlet of 1 column as for 512: the
+// inlet is one word in sixty-four, so one lane of each 32-wide group did the
+// work while the other thirty-one waited. As its own dispatch it costs 0.014
+// ms, and again the same for 1 column as for 512 -- that is not the work
+// either, it is what a second dispatch costs, since the GPU must drain the
+// step before this can start. Both numbers are overhead; this one is smaller.
+
+//
+// S: 0 wpr, 1 h, 2 seed, 3 inlet columns, 4 inlet words, 5 total,
+//    6..12 the seven equilibrium thresholds
+kernel void lgca_inlet(device uint* a           [[buffer(0)]],
+                       device const uint* solid [[buffer(1)]],
+                       constant uint* S         [[buffer(2)]],
+                       uint gid [[thread_position_in_grid]]) {
+    uint iw = S[4];
+    if (gid >= S[1] * iw) return;
+    uint y = gid / iw, j = gid - y * iw;
+    uint word = y * S[0] + j, total = S[5];
+
+    uint span = min(S[3] - j * 32u, 32u);
+    uint imask = (span >= 32u) ? 0xffffffffu : ((1u << span) - 1u);
+    uint apply = imask & ~solid[word];        // a wall is not re-seeded
+    if (apply == 0u) return;
+
+    uint r = mix(word ^ S[2] ^ 0x9e3779b9u);
+    for (uint d = 0; d < 7u; ++d) {
+        uint k = d * total + word;
+        a[k] = (a[k] & ~apply) | (bernoulli(S[6u + d], r) & apply);
+    }
+}
+
+// Coarse-graining, one thread per block of the display grid.
+//
+// The whole point of running the update on the GPU is that the program stops
+// synchronising every step, and a frame is 500 steps but a field sample is
+// 5. So the running time average lives in device memory and is blended here;
+// nothing crosses back until a frame is actually written.
+//
+// Obstacle sites are left out of the mass and momentum -- a block that is half
+// wall reports the velocity of the half that is fluid -- but counted in
+// `sol`, matching `Field::sample`.
+//
+// Q: 0 wpr, 1 total, 2 bx, 3 by, 4 bw, 5 bh, 6 alpha, 7 sqrt(3)/2
+kernel void lgca_sample(device const uint* a     [[buffer(0)]],
+                        device const uint* solid [[buffer(1)]],
+                        device float* ux         [[buffer(2)]],
+                        device float* uy         [[buffer(3)]],
+                        device float* rho        [[buffer(4)]],
+                        device float* sol        [[buffer(5)]],
+                        constant uint* Q         [[buffer(6)]],
+                        uint gid [[thread_position_in_grid]]) {
+    uint bw = Q[4], bh = Q[5];
+    if (gid >= bw * bh) return;
+    uint jb = gid / bw, ib = gid - jb * bw;
+    uint wpr = Q[0], total = Q[1], bx = Q[2], by = Q[3];
+
+    const int CX2[6] = {2, 1, -1, -2, -1, 1};
+    const int CY2[6] = {0, 1, 1, 0, -1, -1};
+
+    // A block is bx columns wide wherever it happens to fall, so it straddles
+    // word boundaries; each row contributes one or two masked words.
+    uint x0 = ib * bx, x1 = x0 + bx;
+    uint w0 = x0 >> 5, w1 = (x1 - 1u) >> 5;
+    int mass = 0, px = 0, py = 0;
+    uint nsolid = 0u;
+    for (uint y = jb * by; y < (jb + 1u) * by; ++y) {
+        uint base = y * wpr;
+        for (uint wi = w0; wi <= w1; ++wi) {
+            uint lo = max(x0, wi << 5) - (wi << 5);
+            uint hi = min(x1, (wi + 1u) << 5) - (wi << 5);
+            uint m = (hi - lo >= 32u) ? 0xffffffffu : (((1u << (hi - lo)) - 1u) << lo);
+            uint sm = solid[base + wi] & m;
+            nsolid += popcount(sm);
+            uint fm = m & ~sm;
+            for (uint d = 0; d < 6u; ++d) {
+                int c = int(popcount(a[d * total + base + wi] & fm));
+                mass += c;
+                px += CX2[d] * c;
+                py += CY2[d] * c;
+            }
+            mass += int(popcount(a[6u * total + base + wi] & fm));
+        }
+    }
+
+    float n = float(bx * by);
+    float m = float(mass);
+    float vx = 0.0f, vy = 0.0f;
+    if (mass > 0) {
+        vx = float(px) * 0.5f / m;
+        vy = float(py) * as_type<float>(Q[7]) / m;
+    }
+    float alpha = as_type<float>(Q[6]);
+    ux[gid] += alpha * (vx - ux[gid]);
+    uy[gid] += alpha * (vy - uy[gid]);
+    rho[gid] += alpha * (m / n - rho[gid]);
+    sol[gid] = float(nsolid) / n;
+}
+
+// Particles on the lattice, obstacle sites included, one thread per row.
+// R: 0 wpr, 1 h, 2 total, 3 lastword, 4 tailmask
+kernel void lgca_count(device const uint* a       [[buffer(0)]],
+                       device atomic_uint* out    [[buffer(1)]],
+                       constant uint* R           [[buffer(2)]],
+                       uint y [[thread_position_in_grid]]) {
+    if (y >= R[1]) return;
+    uint wpr = R[0], total = R[2], lastword = R[3], tail = R[4];
+    uint n = 0u;
+    for (uint d = 0; d < 7u; ++d) {
+        uint base = d * total + y * wpr;
+        for (uint j = 0; j < wpr; ++j) {
+            n += popcount(a[base + j] & ((j == lastword) ? tail : 0xffffffffu));
+        }
+    }
+    atomic_fetch_add_explicit(&out[0], n, memory_order_relaxed);
+}
+
 // Exists so a test can check the emitted circuit itself, rather than a
 // transliteration of it. Each thread is one (state, draw) combination.
 kernel void lgca_verify(device uint* out [[buffer(0)]],
@@ -261,18 +405,56 @@ kernel void lgca_verify(device uint* out [[buffer(0)]],
 // The lattice
 // ---------------------------------------------------------------------------
 
+/// The coarse-grained field, kept on the device between frames so that
+/// sampling every fifth step does not mean synchronising every fifth step.
+struct GpuField {
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+    ux: Buffer,
+    uy: Buffer,
+    rho: Buffer,
+    sol: Buffer,
+}
+
+/// Arguments to `lgca_sample`. Floats go through as bit patterns, which is
+/// exact --- `SQRT3_2` in particular has to be the same number on both sides
+/// or the two paths would disagree about `uy` in the last decimal place.
+fn sample_params(g: &GpuField, wpr: usize, total: usize, alpha: f32) -> [u32; 8] {
+    [
+        wpr as u32,
+        total as u32,
+        g.bx as u32,
+        g.by as u32,
+        g.bw as u32,
+        g.bh as u32,
+        alpha.to_bits(),
+        SQRT3_2.to_bits(),
+    ]
+}
+
 pub struct GpuLattice {
     dev: Device,
     step: Pipeline,
+    inlet: Pipeline,
+    sample: Pipeline,
+    count: Pipeline,
     a: Buffer,
     b: Buffer,
     solid: Buffer,
+    /// One `uint` for `lgca_count` to accumulate into.
+    counter: Buffer,
+    field: Option<GpuField>,
     pub w: usize,
     pub h: usize,
     wpr: usize,
     total: usize,
     pub steps: u64,
     seed: u64,
+    inlet_cols: usize,
+    /// The inflow equilibrium as 24-bit thresholds, rest particle last.
+    thresh: [u32; PLANES],
 }
 
 impl GpuLattice {
@@ -283,16 +465,65 @@ impl GpuLattice {
         let source = format!("#include <metal_stdlib>\nusing namespace metal;\n{}{}",
                              collide_source(rest_particles), KERNELS);
         let step = dev.pipeline(&source, "lgca_step")?;
+        let inlet = dev.pipeline(&source, "lgca_inlet")?;
+        let sample = dev.pipeline(&source, "lgca_sample")?;
+        let count = dev.pipeline(&source, "lgca_count")?;
         let wpr = w.div_ceil(BITS);
         let total = wpr * h;
         let a = dev.buffer(total * PLANES * 4);
         let b = dev.buffer(total * PLANES * 4);
         let solid = dev.buffer(total * 4);
-        Ok(GpuLattice { dev, step, a, b, solid, w, h, wpr, total, steps: 0, seed })
+        let counter = dev.buffer(4);
+        Ok(GpuLattice {
+            dev,
+            step,
+            inlet,
+            sample,
+            count,
+            a,
+            b,
+            solid,
+            counter,
+            field: None,
+            w,
+            h,
+            wpr,
+            total,
+            steps: 0,
+            seed,
+            inlet_cols: 0,
+            thresh: [0; PLANES],
+        })
     }
 
     pub fn device_name(&self) -> String {
         self.dev.name()
+    }
+
+    /// Re-seed the leftmost `cols` columns from the inflow equilibrium on
+    /// every step. The thresholds come from `Equilibrium` itself, so the two
+    /// paths draw the inflow from the same distribution rather than from two
+    /// descriptions of it.
+    pub fn set_inlet(&mut self, cols: usize, density: f32, inflow: (f32, f32), rest: bool) {
+        self.inlet_cols = cols.min(self.w);
+        self.thresh = Equilibrium::new(density, inflow.0, inflow.1, rest).thresholds();
+    }
+
+    /// Give the lattice somewhere on the device to accumulate a coarse-grained
+    /// field, laid out to match a `Field` of the same block size.
+    pub fn attach_field(&mut self, bx: usize, by: usize) {
+        let (bw, bh) = (self.w / bx, self.h / by);
+        let n = bw * bh;
+        self.field = Some(GpuField {
+            bx,
+            by,
+            bw,
+            bh,
+            ux: self.dev.buffer(n * 4),
+            uy: self.dev.buffer(n * 4),
+            rho: self.dev.buffer(n * 4),
+            sol: self.dev.buffer(n * 4),
+        });
     }
 
     fn params(&self) -> [u32; 7] {
@@ -308,6 +539,24 @@ impl GpuLattice {
             tail,
             self.total as u32,
         ]
+    }
+
+    /// Words per row that the inflow boundary touches, and so the width of its
+    /// dispatch. Zero when there is no inlet.
+    fn inlet_words(&self) -> usize {
+        self.inlet_cols.div_ceil(BITS)
+    }
+
+    fn inlet_params(&self) -> [u32; 6 + PLANES] {
+        let mut p = [0u32; 6 + PLANES];
+        p[0] = self.wpr as u32;
+        p[1] = self.h as u32;
+        p[2] = (self.seed ^ self.steps.wrapping_mul(0xD1B5_4A32_D192_ED03)) as u32;
+        p[3] = self.inlet_cols as u32;
+        p[4] = self.inlet_words() as u32;
+        p[5] = self.total as u32;
+        p[6..].copy_from_slice(&self.thresh);
+        p
     }
 
     /// Spread a byte-per-cell lattice across the planes. `SOLID_BIT` goes to
@@ -343,6 +592,16 @@ impl GpuLattice {
         }
     }
 
+    /// Put the lattice back to a given state and random seed, keeping the
+    /// compiled shader. On this path that is the point: compiling costs more
+    /// than a short run does, so a measurement that wants twenty realisations
+    /// should pay for it once.
+    pub fn restart(&mut self, cells: &[u8], seed: u64) {
+        self.load(cells);
+        self.seed = seed;
+        self.steps = 0;
+    }
+
     /// Gather the planes back into one byte per cell.
     pub fn store(&self, cells: &mut [u8]) {
         assert_eq!(cells.len(), self.w * self.h, "wrong number of cells");
@@ -370,24 +629,108 @@ impl GpuLattice {
         }
     }
 
-    /// Run `n` steps. They all go into one command buffer, so the GPU is asked
-    /// once rather than `n` times --- a round trip costs more than a step does.
+    /// Run `n` steps. They go into as few command buffers as the budget below
+    /// allows, so the GPU is asked once rather than `n` times --- a round trip
+    /// costs more than seven steps do.
     pub fn advance(&mut self, n: u64) {
-        const PER_BATCH: u64 = 100;
-        let mut left = n;
+        self.advance_sampling(n, 0, 0.0);
+    }
+
+    /// Advance `n` steps, folding the lattice into the attached field every
+    /// `sample_every` of them --- and at the end of the run, so a ragged last
+    /// chunk is sampled too, as the CPU loop does. `sample_every` of 0 skips
+    /// sampling altogether.
+    ///
+    /// Nothing is read back here. The whole point of batching is that the
+    /// caller synchronises when it wants a frame, not when it wants a sample.
+    pub fn advance_sampling(&mut self, n: u64, sample_every: u64, alpha: f32) {
+        // Enough to keep submission out of the measurement, short enough that
+        // a command buffer never runs long enough to look like a hang.
+        const MAX_DISPATCH: usize = 512;
+        let (total, wpr) = (self.total, self.wpr);
+        let mut batch = self.dev.batch();
+        let (mut left, mut since) = (n, 0u64);
         while left > 0 {
-            let take = left.min(PER_BATCH);
-            let mut batch = self.dev.batch();
-            for _ in 0..take {
-                let p = self.params();
-                let (src, dst) = (&self.a, &self.b);
-                batch.dispatch(&self.step, &[src, dst, &self.solid], &p, self.total as u64);
-                std::mem::swap(&mut self.a, &mut self.b);
-                self.steps += 1;
+            let p = self.params();
+            batch.dispatch(&self.step, &[&self.a, &self.b, &self.solid], &p, total as u64);
+            std::mem::swap(&mut self.a, &mut self.b);
+            self.steps += 1;
+            left -= 1;
+            since += 1;
+
+            // After the step, as the CPU applies it.
+            let iw = self.inlet_words();
+            if iw > 0 {
+                let q = self.inlet_params();
+                batch.dispatch(&self.inlet, &[&self.a, &self.solid], &q, (iw * self.h) as u64);
             }
-            batch.wait();
-            left -= take;
+
+            if sample_every > 0 && (since >= sample_every || left == 0) {
+                since = 0;
+                if let Some(g) = self.field.as_ref() {
+                    let q = sample_params(g, wpr, total, alpha);
+                    batch.dispatch(
+                        &self.sample,
+                        &[&self.a, &self.solid, &g.ux, &g.uy, &g.rho, &g.sol],
+                        &q,
+                        (g.bw * g.bh) as u64,
+                    );
+                }
+            }
+            if batch.dispatches() >= MAX_DISPATCH {
+                batch.wait();
+                batch = self.dev.batch();
+            }
         }
+        batch.wait();
+    }
+
+    /// Fold the current state into the attached field once, and wait. For
+    /// the initial sample, and for tests; a run uses `advance_sampling`.
+    pub fn sample_field(&mut self, alpha: f32) {
+        let Some(g) = self.field.as_ref() else { return };
+        let q = sample_params(g, self.wpr, self.total, alpha);
+        let mut batch = self.dev.batch();
+        batch.dispatch(
+            &self.sample,
+            &[&self.a, &self.solid, &g.ux, &g.uy, &g.rho, &g.sol],
+            &q,
+            (g.bw * g.bh) as u64,
+        );
+        batch.wait();
+    }
+
+    /// Copy the device-side field into a `Field`. Shared storage, so this is a
+    /// memcpy of four small arrays rather than a transfer.
+    pub fn read_field(&self, f: &mut Field) {
+        let g = self.field.as_ref().expect("no field attached to this lattice");
+        assert_eq!(
+            (g.bw, g.bh, g.bx, g.by),
+            (f.bw, f.bh, f.bx, f.by),
+            "the field on the device has a different block grid from the one being filled"
+        );
+        f.ux.copy_from_slice(g.ux.as_slice::<f32>());
+        f.uy.copy_from_slice(g.uy.as_slice::<f32>());
+        f.rho.copy_from_slice(g.rho.as_slice::<f32>());
+        f.solid.copy_from_slice(g.sol.as_slice::<f32>());
+    }
+
+    /// Particles on the lattice, obstacle sites included: the same quantity
+    /// `Lattice::total_particles` counts, without unpacking the planes.
+    pub fn total_particles(&mut self) -> u64 {
+        let lastbit = (self.w - 1) % BITS;
+        let r = [
+            self.wpr as u32,
+            self.h as u32,
+            self.total as u32,
+            ((self.w - 1) / BITS) as u32,
+            if lastbit == 31 { u32::MAX } else { (1u32 << (lastbit + 1)) - 1 },
+        ];
+        self.counter.as_mut_slice::<u32>()[0] = 0;
+        let mut batch = self.dev.batch();
+        batch.dispatch(&self.count, &[&self.a, &self.counter], &r, self.h as u64);
+        batch.wait();
+        u64::from(self.counter.as_slice::<u32>()[0])
     }
 }
 
@@ -584,6 +927,210 @@ mod tests {
         }
     }
 
+    /// Coarse-graining on the device has to produce the field the CPU pass
+    /// produces, block for block --- including the awkward part, which is that
+    /// a block is 20 cells wide and words are 32, so every block straddles a
+    /// word boundary differently.
+    #[test]
+    fn the_gpu_coarse_grains_the_same_field() {
+        if !device_or_skip() {
+            return;
+        }
+        use crate::hex::SQRT3_2;
+        for (w, h, block) in [(256usize, 128usize, 20usize), (200, 96, 16)] {
+            let mut cpu = Lattice::new(w, h, 0.22, (0.3, 0.0), 0, true, 4, 0x5EED);
+            let yc = h as f32 * SQRT3_2 / 2.0;
+            cpu.add_solid(move |x, y| {
+                (x - 60.0) * (x - 60.0) + (y - yc) * (y - yc) <= 18.0 * 18.0
+            });
+            cpu.init_equilibrium();
+            cpu.advance(30);
+
+            let mut want = Field::new(&cpu, block, block);
+            want.sample(&cpu, 1.0);
+
+            let mut g = GpuLattice::new(w, h, true, 1).unwrap();
+            g.attach_field(block, block);
+            g.load(&cpu.cells);
+            g.sample_field(1.0);
+            let mut got = Field::new(&cpu, block, block);
+            g.read_field(&mut got);
+
+            for k in 0..want.ux.len() {
+                for (name, a, b) in [
+                    ("ux", want.ux[k], got.ux[k]),
+                    ("uy", want.uy[k], got.uy[k]),
+                    ("rho", want.rho[k], got.rho[k]),
+                    ("solid", want.solid[k], got.solid[k]),
+                ] {
+                    assert!(
+                        (a - b).abs() < 1e-5,
+                        "{w}x{h} block {block}: {name} at block {k} is {b}, \
+                         the CPU makes it {a}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The running time average is the reason the field lives on the device at
+    /// all, so it has to blend the way `Field::sample` blends.
+    #[test]
+    fn the_gpu_field_averages_over_time() {
+        if !device_or_skip() {
+            return;
+        }
+        const ALPHA: f32 = 0.2;
+        let (w, h, block) = (192usize, 96usize, 16usize);
+        let mut cpu = Lattice::new(w, h, 0.22, (0.3, 0.0), 4, true, 1, 0x5EED);
+        cpu.init_equilibrium();
+
+        let mut want = Field::new(&cpu, block, block);
+        let mut g = GpuLattice::new(w, h, true, 1).unwrap();
+        g.attach_field(block, block);
+        g.load(&cpu.cells);
+
+        // Two independent random streams, so only the averaging itself is
+        // being compared, not the microstates: sample the *same* cells on
+        // both sides each time, and step the CPU between samples.
+        for _ in 0..6 {
+            want.sample(&cpu, ALPHA);
+            g.sample_field(ALPHA);
+            cpu.advance(5);
+            g.load(&cpu.cells);
+        }
+        let mut got = Field::new(&cpu, block, block);
+        g.read_field(&mut got);
+        for k in 0..want.ux.len() {
+            assert!(
+                (want.ux[k] - got.ux[k]).abs() < 1e-5
+                    && (want.rho[k] - got.rho[k]).abs() < 1e-5,
+                "block {k}: ux {} vs {}, rho {} vs {}",
+                want.ux[k], got.ux[k], want.rho[k], got.rho[k]
+            );
+        }
+    }
+
+    /// Counting particles without unpacking the planes.
+    #[test]
+    fn the_gpu_counts_the_same_particles() {
+        if !device_or_skip() {
+            return;
+        }
+        // A width that is not a multiple of 32, so the tail mask matters: if
+        // the count ignored it, the padding bits would have to be clean by
+        // luck rather than by construction.
+        for (w, h) in [(256usize, 64usize), (100, 32), (129, 18)] {
+            let mut cpu = Lattice::new(w, h, 0.3, (0.2, 0.0), 0, true, 1, 0x5EED);
+            cpu.add_solid(|x, y| x > 20.0 && x < 30.0 && y > 5.0 && y < 15.0);
+            cpu.init_equilibrium();
+            cpu.advance(20);
+
+            let mut g = GpuLattice::new(w, h, true, 1).unwrap();
+            g.load(&cpu.cells);
+            assert_eq!(g.total_particles(), cpu.total_particles(), "{w}x{h}");
+        }
+    }
+
+    /// The inflow boundary, which is the one part of the update that creates
+    /// particles rather than moving them.
+    #[test]
+    fn the_inlet_reseeds_at_the_requested_equilibrium() {
+        if !device_or_skip() {
+            return;
+        }
+        const DENSITY: f32 = 0.22;
+        const SPEED: f32 = 0.4;
+        // 40 columns, so the inlet spans two words and the second one is only
+        // partly covered.
+        for cols in [8usize, 40] {
+            let (w, h, steps) = (128usize, 64usize, 60usize);
+            let mut g = GpuLattice::new(w, h, true, 0xC0FFEE).unwrap();
+            g.set_inlet(cols, DENSITY, (SPEED, 0.0), true);
+            let mut cells = vec![0u8; w * h];
+            g.load(&cells);
+
+            let mut hits = [0u64; NDIR + 1];
+            let mut n = 0u64;
+            for _ in 0..steps {
+                g.advance(1);
+                g.store(&mut cells);
+                for y in 0..h {
+                    for x in 0..cols {
+                        let c = cells[y * w + x];
+                        for d in 0..NDIR {
+                            hits[d] += u64::from(c >> d & 1);
+                        }
+                        hits[NDIR] += u64::from(c >> 6 & 1);
+                        n += 1;
+                    }
+                }
+            }
+
+            let want = Equilibrium::new(DENSITY, SPEED, 0.0, true).thresholds();
+            for d in 0..=NDIR {
+                let p = f64::from(want[d]) / f64::from(1u32 << 24);
+                let got = hits[d] as f64 / n as f64;
+                let sigma = (p * (1.0 - p) / n as f64).sqrt();
+                assert!(
+                    (got - p).abs() < 5.0 * sigma,
+                    "inlet of {cols} columns, plane {d}: occupancy {got:.5} against a \
+                     requested {p:.5}, {:.1} sigma out",
+                    (got - p).abs() / sigma
+                );
+            }
+        }
+    }
+
+    /// A wall in the inflow zone stays a wall. If the re-seed ignored the
+    /// solid mask it would manufacture particles inside the obstacle, so an
+    /// all-solid lattice must stay empty however long the inlet runs.
+    #[test]
+    fn the_inlet_does_not_seed_obstacles() {
+        if !device_or_skip() {
+            return;
+        }
+        let (w, h) = (96usize, 32usize);
+        let mut g = GpuLattice::new(w, h, true, 5).unwrap();
+        g.set_inlet(w, 0.4, (0.3, 0.0), true);
+        let mut cells = vec![SOLID_BIT; w * h];
+        g.load(&cells);
+        g.advance(10);
+        g.store(&mut cells);
+        assert!(
+            cells.iter().all(|&c| c == SOLID_BIT),
+            "the inlet wrote particles into {} obstacle cells",
+            cells.iter().filter(|&&c| c != SOLID_BIT).count()
+        );
+    }
+
+    /// The re-seed must stop at the column it is told to stop at.
+    #[test]
+    fn the_inlet_leaves_the_rest_of_the_lattice_alone() {
+        if !device_or_skip() {
+            return;
+        }
+        let (w, h, cols) = (128usize, 32usize, 8usize);
+        let mut g = GpuLattice::new(w, h, true, 9).unwrap();
+        g.set_inlet(cols, 0.4, (0.3, 0.0), true);
+        let mut cells = vec![0u8; w * h];
+        g.load(&cells);
+        // One step: the inlet has been written, and nothing has had time to
+        // travel out of it yet.
+        g.advance(1);
+        g.store(&mut cells);
+        for y in 0..h {
+            for x in cols..w {
+                assert_eq!(cells[y * w + x], 0, "cell ({x}, {y}) was written");
+            }
+        }
+        let seeded = (0..h)
+            .flat_map(|y| (0..cols).map(move |x| y * w + x))
+            .filter(|&i| cells[i] != 0)
+            .count();
+        assert!(seeded > h * cols / 2, "the inlet barely seeded anything: {seeded}");
+    }
+
     /// The acceptance test for the whole phase: a second implementation of the
     /// rule is only worth having if it is the same fluid.
     ///
@@ -710,6 +1257,144 @@ mod tests {
         assert!(
             rel < 0.12,
             "the GPU is a different fluid: nu = {nu_gpu:.4} against the CPU's {nu_cpu:.4}"
+        );
+    }
+
+    /// The other half of the acceptance test.
+    ///
+    /// Viscosity says the fluid dissipates the same; this says it *advects*
+    /// the same, which is the coefficient the Reynolds number is proportional
+    /// to. A transverse wave riding on a uniform stream is carried along at
+    /// `g * U` rather than at `U` --- a lattice gas is not Galilean invariant
+    /// --- so the drift of the mode's phase measures `g` directly.
+    ///
+    /// Same shape as the viscosity test above: an identical protocol from
+    /// identical initial cells, averaged over realisations before the fit.
+    ///
+    ///     cargo test --release --lib -- --ignored --nocapture advection
+    ///
+    /// This is by far the sharper of the two acceptance tests, and worth
+    /// having for that reason. Measured over four independent estimates the
+    /// spread is 0.24% on the CPU and 0.11% on the GPU, against 4% and 8% for
+    /// the viscosity fit --- a phase that turns steadily is a much cleaner
+    /// thing to measure than an amplitude decaying into the lattice's own
+    /// noise. So the tolerance here is 3%, some ten standard deviations of the
+    /// difference between two estimates, and it would notice a change in `g`
+    /// that the viscosity test would never see.
+    #[test]
+    #[ignore = "several seconds; run deliberately after changing the rule"]
+    fn the_gpu_fluid_has_the_same_advection_factor() {
+        if !device_or_skip() {
+            return;
+        }
+        use crate::lattice::Equilibrium;
+        use crate::moments;
+        use crate::transport::column_uy;
+        use std::f64::consts::PI;
+
+        const SIZE: usize = 256;
+        const DENSITY: f32 = 0.22;
+        const U0: f32 = 0.25;
+        const TRANSIENT: u64 = 200;
+        const SAMPLES: usize = 20;
+        // The phase turns at g * U * k, about 0.0027 rad a step, and the
+        // amplitude decays with an e-folding time of some 5,000 steps. A
+        // 2,000-step window turns far enough to fit and not so far that the
+        // mode has gone.
+        const INTERVAL: u64 = 100;
+        const REPS: u64 = 16;
+        let (w, h) = (SIZE, SIZE);
+        let k = 2.0 * std::f32::consts::PI / w as f32;
+        let amp = 0.05f32;
+
+        let project = |cells: &[u8]| -> (f64, f64) {
+            let u = column_uy(cells, w, h);
+            let (mut a, mut b) = (0.0f64, 0.0f64);
+            for x in 0..w {
+                let p = k * x as f32;
+                a += (u[x] * p.cos()) as f64;
+                b += (u[x] * p.sin()) as f64;
+            }
+            (2.0 * a / w as f64, 2.0 * b / w as f64)
+        };
+        let seeded = |rep: u64| -> Vec<u8> {
+            let s = 0x5EED ^ (rep.wrapping_mul(0x9E37_79B9) << 20) ^ 0x1357;
+            let mut rng = Rng::new(s ^ 0xF00D);
+            let cols: Vec<Equilibrium> = (0..w)
+                .map(|x| Equilibrium::new(DENSITY, U0, amp * (k * x as f32).sin(), true))
+                .collect();
+            let mut cells = vec![0u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    cells[y * w + x] = cols[x].sample(&mut rng);
+                }
+            }
+            cells
+        };
+        // The realised mean speed, not the requested one, is what advects it.
+        let u_actual = moments::sum(&moments::WITH_WALLS, &seeded(0)).velocity().0;
+
+        // Unwrap the phase and fit its drift.
+        let fit = |trace: &[(f64, f64)]| -> f32 {
+            let mut unwrapped = 0.0f64;
+            let mut prev = trace[0].0.atan2(trace[0].1);
+            let mut pts = Vec::with_capacity(trace.len());
+            for (i, (a, b)) in trace.iter().enumerate() {
+                let mut delta = a.atan2(*b) - prev;
+                while delta > PI {
+                    delta -= 2.0 * PI;
+                }
+                while delta < -PI {
+                    delta += 2.0 * PI;
+                }
+                unwrapped += delta;
+                prev = a.atan2(*b);
+                pts.push(((i as u64 * INTERVAL) as f64, unwrapped));
+            }
+            let n = pts.len() as f64;
+            let sx: f64 = pts.iter().map(|p| p.0).sum();
+            let sy: f64 = pts.iter().map(|p| p.1).sum();
+            let sxx: f64 = pts.iter().map(|p| p.0 * p.0).sum();
+            let sxy: f64 = pts.iter().map(|p| p.0 * p.1).sum();
+            let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+            (-slope / (k * u_actual) as f64) as f32
+        };
+
+        let mut cpu_trace = vec![(0.0f64, 0.0f64); SAMPLES];
+        let mut gpu_trace = vec![(0.0f64, 0.0f64); SAMPLES];
+        for rep in 0..REPS {
+            let start = seeded(rep);
+            let seed = 0x5EED ^ (rep << 20);
+
+            let mut cpu = Lattice::new(w, h, DENSITY, (U0, 0.0), 0, true, 4, seed);
+            cpu.restart(&start, seed);
+            cpu.advance(TRANSIENT);
+            for slot in cpu_trace.iter_mut() {
+                let (a, b) = project(&cpu.cells);
+                slot.0 += a / REPS as f64;
+                slot.1 += b / REPS as f64;
+                cpu.advance(INTERVAL);
+            }
+
+            let mut gpu = GpuLattice::new(w, h, true, seed).unwrap();
+            gpu.load(&start);
+            gpu.advance(TRANSIENT);
+            let mut cells = vec![0u8; w * h];
+            for slot in gpu_trace.iter_mut() {
+                gpu.store(&mut cells);
+                let (a, b) = project(&cells);
+                slot.0 += a / REPS as f64;
+                slot.1 += b / REPS as f64;
+                gpu.advance(INTERVAL);
+            }
+        }
+
+        let (g_cpu, g_gpu) = (fit(&cpu_trace), fit(&gpu_trace));
+        let rel = (g_gpu - g_cpu).abs() / g_cpu;
+        println!("advection: cpu g = {g_cpu:.4}, gpu g = {g_gpu:.4} ({:.1}% apart)", 100.0 * rel);
+        assert!(
+            rel < 0.03,
+            "the GPU advects differently: g = {g_gpu:.4} against the CPU's {g_cpu:.4}"
         );
     }
 

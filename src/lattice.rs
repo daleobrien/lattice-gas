@@ -81,6 +81,16 @@ impl Equilibrium {
         }
     }
 
+    /// The 24-bit thresholds themselves, rest particle last. The GPU builds
+    /// its inlet from these rather than from its own copy of the expansion, so
+    /// that both paths seed the inflow from the same distribution.
+    pub fn thresholds(&self) -> [u32; NDIR + 1] {
+        let mut t = [0u32; NDIR + 1];
+        t[..NDIR].copy_from_slice(&self.thresh);
+        t[NDIR] = self.rest.unwrap_or(0);
+        t
+    }
+
     /// One cell state. Six directions come from three steps of the generator,
     /// two 24-bit samples each.
     ///
@@ -163,6 +173,23 @@ impl Lattice {
     #[inline]
     pub fn threads(&self) -> usize {
         self.threads
+    }
+
+    /// The seed this lattice was built with, so that a second implementation
+    /// of the same run can be given the same one.
+    #[inline]
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Put the lattice back to a given state and random seed. The obstacles,
+    /// the collision table and the inflow are whatever they already were, so
+    /// this is a restart of the same experiment rather than a new one.
+    pub fn restart(&mut self, cells: &[u8], seed: u64) {
+        assert_eq!(cells.len(), self.cells.len(), "wrong number of cells");
+        self.cells.copy_from_slice(cells);
+        self.seed = seed;
+        self.steps = 0;
     }
 
     /// Fill the whole domain with the inflow equilibrium so the run starts

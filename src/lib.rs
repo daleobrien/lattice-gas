@@ -18,4 +18,5 @@ pub mod moments;
 pub mod png;
 pub mod render;
 pub mod rng;
+pub mod sim;
 pub mod transport;

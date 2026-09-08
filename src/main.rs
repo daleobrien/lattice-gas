@@ -4,6 +4,7 @@
 use lattice_gas::hex::SQRT3_2;
 use lattice_gas::lattice::Lattice;
 use lattice_gas::render::{self, Field};
+use lattice_gas::sim::Sim;
 use lattice_gas::transport;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -28,6 +29,7 @@ struct Config {
     arrow_scale: f32,
     rest_particles: bool,
     threads: usize,
+    gpu: bool,
     seed: u64,
     nu: Option<f32>,
     quiet: bool,
@@ -62,6 +64,7 @@ impl Default for Config {
             arrow_scale: 1.6,
             rest_particles: true,
             threads: 0,
+            gpu: true,
             seed: 0x5EED,
             nu: None,
             quiet: false,
@@ -94,6 +97,8 @@ cells in about 8 MB, a few minutes of wall time.
   --arrow-scale F      arrow length multiplier      (default 1.6)
   --rest               use rest particles, FHP-III   (default on)\n  --no-rest            six directions only, as in the book
   --threads N          worker threads               (default: all cores)
+  --gpu                run the update on the GPU    (default: on if there is one)
+  --no-gpu             run it on the CPU instead
   --seed N             random seed
   --nu F               assume this viscosity when reporting Reynolds number
   --measure            measure viscosity and advection factor, then exit
@@ -144,6 +149,8 @@ fn parse_args() -> Result<(Config, Mode), String> {
             "--threads" => c.threads = val()?.parse().map_err(|e| format!("{e}"))?,
             "--seed" => c.seed = val()?.parse().map_err(|e| format!("{e}"))?,
             "--nu" => c.nu = Some(val()?.parse().map_err(|e| format!("{e}"))?),
+            "--gpu" => c.gpu = true,
+            "--no-gpu" => c.gpu = false,
             "--rest" => c.rest_particles = true,
             "--no-rest" => c.rest_particles = false,
             "--measure" | "--measure-viscosity" => mode = Mode::Measure,
@@ -195,7 +202,7 @@ fn main() {
     match mode {
         Mode::Measure => {
             let t = Instant::now();
-            let tr = transport::measure(c.density, c.rest_particles, threads(&c), c.seed, 256);
+            let tr = transport::measure(c.density, c.rest_particles, threads(&c), c.seed, 256, c.gpu);
             println!(
                 "density {:.4} per direction ({:.2} particles per cell), rest particles: {}\n\
                  kinematic viscosity  nu = {:.4}\n\
@@ -219,7 +226,7 @@ fn main() {
             println!("  d      particles/cell     nu       g      g/nu");
             let mut d = 0.04;
             while d <= 0.46 {
-                let tr = transport::measure(d, c.rest_particles, threads(&c), c.seed, 256);
+                let tr = transport::measure(d, c.rest_particles, threads(&c), c.seed, 256, c.gpu);
                 println!(
                     "{:6.3}   {:8.2}        {:7.4}  {:6.3}  {:7.3}",
                     d,
@@ -269,28 +276,33 @@ fn run(c: Config) {
     if !c.quiet {
         println!("measuring transport coefficients...");
     }
-    let mut tr = transport::measure(c.density, c.rest_particles, nth, c.seed, 256);
+    let mut tr = transport::measure(c.density, c.rest_particles, nth, c.seed, 256, c.gpu);
     if let Some(nu) = c.nu {
         tr.nu = nu;
     }
     let re = tr.reynolds(c.speed, c.size);
 
+    let mut field = Field::new(&lat, c.block, c.block);
+    let (table_states, table_active, table_stride) =
+        (lat.table.n_states, lat.table.active_states(), lat.table.stride());
+    let (mut sim, running_on) = Sim::new(lat, c.gpu);
+    sim.attach_field(&field);
+
     if !c.quiet {
         println!(
-            "lattice {} x {} = {:.1}M cells, {} threads\n\
+            "lattice {} x {} = {:.1}M cells, running on the {running_on}\n\
              density {:.4}/direction ({:.2} particles per cell), inflow speed {:.2}\n\
              collision table: {} states, {} of them with alternatives, stride {}\n\
              nu = {:.4}, g = {:.3}  ->  Reynolds number ~ {:.0} on L = {:.0}\n",
             c.width,
             c.height,
             (c.width * c.height) as f32 / 1e6,
-            nth,
             c.density,
             c.density * if c.rest_particles { 7.0 } else { 6.0 },
             c.speed,
-            lat.table.n_states,
-            lat.table.active_states(),
-            lat.table.stride(),
+            table_states,
+            table_active,
+            table_stride,
             tr.nu,
             tr.g,
             re,
@@ -298,65 +310,65 @@ fn run(c: Config) {
         );
     }
 
-    let mut field = Field::new(&lat, c.block, c.block);
     let start = Instant::now();
-    let mass0 = lat.total_particles();
+    let mass0 = sim.total_particles();
 
     if c.warmup > 0 {
-        lat.advance(c.warmup);
+        sim.advance(c.warmup);
     }
-    field.sample(&lat, 1.0);
+    sim.sample(&mut field, 1.0);
 
     let mut frame = 0usize;
     let mut step = 0u64;
     while step < c.steps {
-        let chunk = c.sample_every.min(c.steps - step);
-        lat.advance(chunk);
+        // Run to the next frame in one go. On the GPU that is one command
+        // buffer and one synchronisation; sampling every fifth step from the
+        // CPU side would cost more than the steps themselves.
+        let to_frame = c.frame_every - step % c.frame_every;
+        let chunk = to_frame.min(c.steps - step);
+        sim.advance_sampling(chunk, c.sample_every, c.alpha, &mut field);
         step += chunk;
-        field.sample(&lat, c.alpha);
 
-        if step % c.frame_every == 0 || step == c.steps {
-            let mean = field.mean_velocity();
-            let vort = field.vorticity();
-            let wmax = {
-                let mut v: Vec<f32> = vort
-                    .iter()
-                    .enumerate()
-                    .filter(|(k, _)| field.solid[*k] < 0.12)
-                    .map(|(_, x)| x.abs())
-                    .collect();
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                v.get(v.len() * 98 / 100).copied().unwrap_or(1e-3).max(1e-5)
-            };
+        let mean = field.mean_velocity();
+        let vort = field.vorticity();
+        let wmax = {
+            let mut v: Vec<f32> = vort
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| field.solid[*k] < 0.12)
+                .map(|(_, x)| x.abs())
+                .collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v.get(v.len() * 98 / 100).copied().unwrap_or(1e-3).max(1e-5)
+        };
 
-            let png = c.out.join(format!("vorticity-{frame:04}.png"));
-            render::write_vorticity(&png, &field, c.scale, wmax).expect("png write failed");
-            let svg = c.out.join(format!("arrows-{frame:04}.svg"));
-            render::write_arrows(&svg, &field, c.arrow_scale, mean).expect("svg write failed");
+        let png = c.out.join(format!("vorticity-{frame:04}.png"));
+        render::write_vorticity(&png, &field, c.scale, wmax).expect("png write failed");
+        let svg = c.out.join(format!("arrows-{frame:04}.svg"));
+        render::write_arrows(&svg, &field, c.arrow_scale, mean).expect("svg write failed");
 
-            if !c.quiet {
-                let rate = (c.width * c.height) as f64 * step as f64
-                    / start.elapsed().as_secs_f64()
-                    / 1e6;
-                let cells_per = if c.rest_particles { 7.0 } else { 6.0 };
-                println!(
-                    "step {step:>7}/{}  mean u = ({:+.3}, {:+.3})  density = {:.3}/dir  \
-                     {rate:.0}M cell-updates/s  -> {}",
-                    c.steps,
-                    mean.0,
-                    mean.1,
-                    lat.total_particles() as f32 / (c.width * c.height) as f32 / cells_per,
-                    png.display()
-                );
-                if c.preview {
-                    print!("{}", render::ascii_preview(&field, 100, 22));
-                }
+        if !c.quiet {
+            let rate = (c.width * c.height) as f64 * step as f64
+                / start.elapsed().as_secs_f64()
+                / 1e6;
+            let cells_per = if c.rest_particles { 7.0 } else { 6.0 };
+            println!(
+                "step {step:>7}/{}  mean u = ({:+.3}, {:+.3})  density = {:.3}/dir  \
+                 {rate:.0}M cell-updates/s  -> {}",
+                c.steps,
+                mean.0,
+                mean.1,
+                sim.total_particles() as f32 / (c.width * c.height) as f32 / cells_per,
+                png.display()
+            );
+            if c.preview {
+                print!("{}", render::ascii_preview(&field, 100, 22));
             }
-            frame += 1;
         }
+        frame += 1;
     }
 
-    let mass1 = lat.total_particles();
+    let mass1 = sim.total_particles();
     if !c.quiet {
         println!(
             "\ndone in {:.1}s. {frame} frames in {}. particle count {} -> {} ({}).",
