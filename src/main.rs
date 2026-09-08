@@ -1,20 +1,10 @@
-//! A cellular-automaton fluid, after the model in *A New Kind of Science*
-//! (Wolfram, pp. 378-380): identical particles hop between sites of a
-//! hexagonal lattice and collide by momentum-conserving rules. Averaged over
-//! blocks of cells, the discrete gas behaves like a continuum fluid, and past
-//! an obstacle it sheds a von Karman vortex street.
+//! Command-line driver for the hexagonal lattice gas. The simulation itself
+//! lives in the `lattice_gas` library alongside this binary.
 
-mod collision;
-mod hex;
-mod lattice;
-mod png;
-mod render;
-mod rng;
-mod transport;
-
-use hex::SQRT3_2;
-use lattice::Lattice;
-use render::Field;
+use lattice_gas::hex::SQRT3_2;
+use lattice_gas::lattice::Lattice;
+use lattice_gas::render::{self, Field};
+use lattice_gas::transport;
 use std::path::PathBuf;
 use std::time::Instant;
 

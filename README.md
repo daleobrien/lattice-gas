@@ -157,6 +157,16 @@ matches the FHP prediction across the whole density range, as described above,
 and the wake sheds at a Strouhal number of about 0.11, which is the right range
 for a plate held across the flow at this Reynolds number.
 
+## Speed
+
+`cargo bench` runs the benchmark suite in `benches/speed.rs` and reports the
+change against the numbers recorded in `benches/baseline.txt`. The cases cover
+the update kernel at both cache-resident and production sizes, threaded and
+not, the coarse-graining and analysis passes, the PNG and SVG writers, and the
+startup viscosity measurement. [BENCHMARKS.md](BENCHMARKS.md) has the recorded
+figures, what each case is for, and where the time in a default run actually
+goes -- which is not where one would guess.
+
 ## Notes and limitations
 
 * The bulk density settles a few percent below the inlet density, with the

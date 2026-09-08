@@ -1,0 +1,31 @@
+# lattice-gas benchmark baseline: nanoseconds per iteration.
+#
+# `cargo bench` reads this file and reports the change against it.
+# Re-record it with `cargo bench -- --save-baseline`, on an idle
+# machine, and note in the commit message what the machine was:
+# these numbers are only comparable to others taken on the same one.
+#
+# cpu: Apple M3 Pro (12 cores, macos-aarch64)
+# rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+# threads used: 12
+#
+# name                                        ns/iter    throughput
+step/512x512/t1                                610484.4    429.4 Mcell/s
+step/512x512/tN                                190236.4    1378.0 Mcell/s
+step/512x512/t1/no-rest                        614805.8    426.4 Mcell/s
+step/512x512/tN/plate                          189777.4    1381.3 Mcell/s
+step/512x512/tN/inlet                          241050.8    1087.5 Mcell/s
+step/2048x1280/t1                            10805468.0    242.6 Mcell/s
+step/2048x1280/tN                             2021571.7    1296.7 Mcell/s
+step/2048x64/tN                                124010.2    1056.9 Mcell/s
+field/sample/2048x1280                       22571937.5    116.1 Mcell/s
+field/vorticity/2048x1280                        8986.0    -
+field/mean-velocity/2048x1280                    4526.4    -
+lattice/total-particles/2048x1280               44798.9    58515.8 Mcell/s
+lattice/mean-velocity/2048x1280              23062777.8    113.7 Mcell/s
+render/write-vorticity/png                    6244458.3    58.5 Mpx/s
+render/write-arrows/svg                       2968736.7    -
+collision/build/rest                             9016.6    -
+collision/build/no-rest                          3478.8    -
+lattice/init-equilibrium/2048x1280           29099941.6    90.1 Mcell/s
+transport/measure/64                        261425500.0    -
