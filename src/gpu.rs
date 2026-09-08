@@ -584,6 +584,135 @@ mod tests {
         }
     }
 
+    /// The acceptance test for the whole phase: a second implementation of the
+    /// rule is only worth having if it is the same fluid.
+    ///
+    /// A transverse shear wave in a quiescent periodic box decays as
+    /// `exp(-nu k^2 t)`, so fitting the log amplitude measures the viscosity
+    /// the code actually has. Both paths are driven through the identical
+    /// protocol from the identical initial cells, and averaged over four
+    /// realisations first, because the lattice is noisy and the signal adds
+    /// while the fluctuations cancel.
+    /// Deliberately `#[ignore]`d: it runs the CPU path for twenty thousand
+    /// steps and takes several seconds, which does not belong in the ordinary
+    /// test loop. Run it after touching the rule or the shader:
+    ///
+    ///     cargo test --release --lib -- --ignored --nocapture viscosity
+    ///
+    /// Measured over four independent estimates, this estimator has a spread of
+    /// about 4% on the CPU and 8% on the GPU at this size, so the tolerance is
+    /// set to catch a real difference in the fluid rather than a noisy draw.
+    /// Both paths sit a little above the 0.2989 that `transport::measure`
+    /// reports, because that picks its fitting window adaptively and this uses
+    /// a fixed one; the point here is the difference between the two, which is
+    /// measured the same way on both sides.
+    #[test]
+    #[ignore = "several seconds; run deliberately after changing the rule"]
+    fn the_gpu_fluid_has_the_same_viscosity() {
+        if !device_or_skip() {
+            return;
+        }
+        use crate::hex::SQRT3_2;
+        use crate::lattice::Equilibrium;
+        use crate::moments;
+
+        const SIZE: usize = 256;
+        const DENSITY: f32 = 0.22;
+        const TRANSIENT: u64 = 200;
+        const SAMPLES: usize = 20;
+        // The mode decays as exp(-nu k^2 t) with k^2 about 8e-4 here, so the
+        // window has to run into the thousands of steps for the amplitude to
+        // fall far enough to fit against. A short one measures mostly noise.
+        const INTERVAL: u64 = 250;
+        const REPS: u64 = 16;
+        let (w, h) = (SIZE, SIZE);
+        let k = 2.0 * std::f32::consts::PI / (h as f32 * SQRT3_2);
+        let amp = 0.05f32;
+
+        // The mode amplitude: row-mean velocity projected onto cos and sin.
+        let project = |cells: &[u8]| -> (f64, f64) {
+            let (mut a, mut b) = (0.0f64, 0.0f64);
+            for y in 0..h {
+                let m = moments::sum(&moments::WITH_WALLS, &cells[y * w..(y + 1) * w]);
+                let u = m.velocity().0;
+                let p = k * y as f32 * SQRT3_2;
+                a += (u * p.cos()) as f64;
+                b += (u * p.sin()) as f64;
+            }
+            (2.0 * a / h as f64, 2.0 * b / h as f64)
+        };
+        let seeded = |rep: u64| -> Vec<u8> {
+            let s = 0x5EED ^ (rep.wrapping_mul(0x9E37_79B9) << 20);
+            let mut rng = Rng::new(s ^ 0xBEEF);
+            let mut cells = vec![0u8; w * h];
+            for y in 0..h {
+                let ux = amp * (k * y as f32 * SQRT3_2).sin();
+                let eq = Equilibrium::new(DENSITY, ux, 0.0, true);
+                for x in 0..w {
+                    cells[y * w + x] = eq.sample(&mut rng);
+                }
+            }
+            cells
+        };
+        let fit = |trace: &[(f64, f64)]| -> f32 {
+            let pts: Vec<(f64, f64)> = trace
+                .iter()
+                .enumerate()
+                .map(|(i, (a, b))| {
+                    ((i as u64 * INTERVAL) as f64, (a * a + b * b).sqrt().max(1e-12).ln())
+                })
+                .collect();
+            let n = pts.len() as f64;
+            let sx: f64 = pts.iter().map(|p| p.0).sum();
+            let sy: f64 = pts.iter().map(|p| p.1).sum();
+            let sxx: f64 = pts.iter().map(|p| p.0 * p.0).sum();
+            let sxy: f64 = pts.iter().map(|p| p.0 * p.1).sum();
+            let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+            (-slope / (k * k) as f64) as f32
+        };
+
+        let mut cpu_trace = vec![(0.0f64, 0.0f64); SAMPLES];
+        let mut gpu_trace = vec![(0.0f64, 0.0f64); SAMPLES];
+        for rep in 0..REPS {
+            let start = seeded(rep);
+            let seed = 0x5EED ^ (rep << 20);
+
+            let mut cpu = Lattice::new(w, h, DENSITY, (0.0, 0.0), 0, true, 4, seed);
+            cpu.cells.copy_from_slice(&start);
+            cpu.advance(TRANSIENT);
+            for slot in cpu_trace.iter_mut() {
+                let (a, b) = project(&cpu.cells);
+                slot.0 += a / REPS as f64;
+                slot.1 += b / REPS as f64;
+                cpu.advance(INTERVAL);
+            }
+
+            let mut gpu = GpuLattice::new(w, h, true, seed).unwrap();
+            gpu.load(&start);
+            gpu.advance(TRANSIENT);
+            let mut cells = vec![0u8; w * h];
+            for slot in gpu_trace.iter_mut() {
+                gpu.store(&mut cells);
+                let (a, b) = project(&cells);
+                slot.0 += a / REPS as f64;
+                slot.1 += b / REPS as f64;
+                gpu.advance(INTERVAL);
+            }
+        }
+
+        let (nu_cpu, nu_gpu) = (fit(&cpu_trace), fit(&gpu_trace));
+        let rel = (nu_gpu - nu_cpu).abs() / nu_cpu;
+        println!(
+            "viscosity: cpu nu = {nu_cpu:.4}, gpu nu = {nu_gpu:.4} ({:.1}% apart); \
+             transport::measure reports 0.2989 for this density",
+            100.0 * rel
+        );
+        assert!(
+            rel < 0.12,
+            "the GPU is a different fluid: nu = {nu_gpu:.4} against the CPU's {nu_cpu:.4}"
+        );
+    }
+
     /// The GPU is a second implementation of the same model, so it should
     /// reproduce the CPU's statistics even though the random streams differ.
     #[test]

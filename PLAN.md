@@ -242,15 +242,41 @@ transliteration of it:
   250 steps, `load_and_store_round_trip` on a width of 100, and a bulk
   comparison against the CPU.
 
+### The same fluid
+
+A faster second implementation is only worth having if it is the same fluid, so
+`the_gpu_fluid_has_the_same_viscosity` seeds a transverse shear wave in a
+quiescent periodic box and fits its decay, driving both paths through an
+identical protocol from identical initial cells. Over sixteen realisations:
+
+    cpu nu = 0.3178, gpu nu = 0.3309 --- 4.1% apart
+
+That is inside the estimator's own noise. Measured across four independent
+estimates, the spread of this fit is about 4% on the CPU and 8% on the GPU at
+256x256, so a single pair can easily land 10% apart --- as an earlier run of
+this test did, before the window was long enough and the realisations
+plentiful enough to mean anything. Both sit a little above the 0.2989
+`transport::measure` reports, because that chooses its fitting window
+adaptively and this uses a fixed one; the comparison is between two numbers
+measured the same way.
+
+The test is `#[ignore]`d, since it steps the CPU path twenty thousand times and
+takes about seven seconds:
+
+```bash
+cargo test --release --lib -- --ignored --nocapture viscosity
+```
+
 ### Still to do
 
 * Coarse-graining as a GPU kernel, so a frame does not force a round trip every
-  fifth step.
+  fifth step. At 0.0345 ms a step, syncing every fifth one would cost more than
+  the steps do.
 * The inlet re-seed, which is 44% of a step at this speed if it stays on the CPU.
-* Driving `transport::measure` from the GPU path, and with it the acceptance
-  test: nu and g must still come out at 0.2989 and 0.440.
-* Wiring into `main.rs`, with the CPU path kept as the reference the golden
-  tests run against.
+* The advection factor `g`, the other half of the acceptance test, measured the
+  same way as the viscosity above.
+* Wiring into `main.rs` and `transport::measure`, with the CPU path kept as the
+  reference the golden tests run against.
 
 ### Notes from building it
 
