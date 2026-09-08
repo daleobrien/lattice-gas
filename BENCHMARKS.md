@@ -71,20 +71,21 @@ what it is -- a busy machine -- rather than being folded into the result.
 The point of the suite is not the individual numbers but the budget they add
 up to. For the default run -- 2048x1280 cells, 6,000 warmup steps then 40,000
 recorded ones, a field sample every 5 steps, a frame every 500 -- the measured
-per-call costs predict this, and the binary takes 3.1 s against the 3.4 s
-predicted:
+per-call costs predict this:
 
 | Phase | Calls | Each | Total | Share |
 | --- | ---: | ---: | ---: | ---: |
-| `GpuLattice::advance_sampling` | 46,000 | 0.048 ms | 2.2 s | **65%** |
-| Writing frames (PNG + SVG) | 80 | 9.6 ms | 0.8 s | 22% |
-| `transport::measure` at startup | 1 | 0.7 s | 0.7 s | 20% |
-| `init_equilibrium` | 1 | 17 ms | 0.02 s | <1% |
+| `GpuLattice::advance_sampling` | 46,000 | 0.048 ms | 2.2 s | **59%** |
+| Writing frames (PNG + SVG) | 80 | 9.7 ms | 0.8 s | 21% |
+| `transport::measure` at startup | 1 | 0.7 s | 0.7 s | 19% |
+| `init_equilibrium` | 1 | 18 ms | 0.02 s | <1% |
 
 The step figure is `step/gpu/2048x1280/batched+inlet+sample`, which is the
 production configuration: the inflow boundary and a field sample every fifth
 step, both on the GPU, batched so the program synchronises once a frame rather
-than once a sample.
+than once a sample. The binary takes 3.1 s against the 3.7 s this predicts,
+because a real run puts 500 steps in a command buffer where the benchmark case
+puts 100, so it pays the submission a fifth as often.
 
 On `--no-gpu` the same table reads 74 s for `Lattice::step`, 1.5 s for
 `Field::sample` and 6.1 s for the startup measurement, and the run takes 1.4
@@ -110,9 +111,9 @@ to stop. `PLAN.md` has the history.
 in the program that has to be fast.
 
 * `512x512/t1` vs `2048x1280/t1`: the same kernel in and out of cache. The
-  full-size update runs at 244 Mcell/s against 459 in cache, so 53% of the
+  full-size update runs at 244 Mcell/s against 452 in cache, so 54% of the
   in-cache rate is what the memory system leaves it.
-* `512x512/tN` vs `512x512/t1`: 3.1x from 12 threads.
+* `512x512/tN` vs `512x512/t1`: 3.3x from 12 threads.
 * `2048x1280/tN`: the number that decides how long a real run takes.
 * `2048x64/tN`: a short, wide lattice pays the per-step `thread::scope` cost
   over far fewer rows, so this is where thread-spawn overhead shows up.
@@ -121,8 +122,8 @@ in the program that has to be fast.
   bottleneck.
 * `tN/plate`: solid cells take the other arm of the inner branch.
 * `tN/inlet`: the inlet re-seed is serial, so the gap to plain `512x512/tN`
-  (185 -> 224 us) is the cost of the one part of `step` that does not scale.
-  Those 39 us are for 512 rows; a full-height run pays about 95 us per step,
+  (178 -> 210 us) is the cost of the one part of `step` that does not scale.
+  Those 32 us are for 512 rows; a full-height run pays about 80 us per step,
   which is small against the CPU update and is not small against the GPU one.
 
 **`step/gpu/*`** -- the same update on the GPU, as bitplanes. The four cases
@@ -151,9 +152,9 @@ frame's worth of steps to `advance_sampling` rather than calling it per sample.
 **`field/*`, `lattice/mean-velocity`, `lattice/total-particles`** -- the
 CPU analysis passes, all three of which now read the cell array a word at a
 time.
-`total_particles` popcounts eight cells per instruction and manages 57.8
+`total_particles` popcounts eight cells per instruction and manages 58.1
 Gcell/s; `Field::sample` and `Lattice::mean_velocity` look each cell byte up in
-the packed-moment tables in `src/moments.rs` and reach 13.6 and 5.2 Gcell/s.
+the packed-moment tables in `src/moments.rs` and reach 15.0 and 5.1 Gcell/s.
 They used to take the cell apart a bit at a time on a single thread, at 116 and
 114 Mcell/s, and the 500x gap between those and `total_particles` was the whole
 story of this section. Closing it is most of what took the default run from 4.7
@@ -183,29 +184,37 @@ and those are worth trusting at the 1-2% level.
 ## Recorded baseline
 
 Apple M3 Pro, 12 cores, macOS, rustc 1.97.1, 2026-09-09. Best of seven
-samples; throughput counts lattice cells updated or touched per second.
+samples; throughput counts lattice cells updated or touched per second. The
+`step/gpu/*batched*` cases each cover 100 steps, so divide by 100 for a
+per-step figure.
 
 | Case | Time | Throughput |
 | --- | ---: | ---: |
-| `step/512x512/t1` | 571.00 us | 459.1 Mcell/s |
-| `step/512x512/tN` | 184.97 us | 1417.3 Mcell/s |
-| `step/512x512/t1/no-rest` | 582.40 us | 450.1 Mcell/s |
-| `step/512x512/tN/plate` | 188.73 us | 1389.0 Mcell/s |
-| `step/512x512/tN/inlet` | 224.44 us | 1168.0 Mcell/s |
-| `step/2048x1280/t1` | 10.748 ms | 243.9 Mcell/s |
-| `step/2048x1280/tN` | 1.521 ms | 1723.0 Mcell/s |
-| `step/2048x64/tN` | 127.20 us | 1030.4 Mcell/s |
-| `field/sample/2048x1280` | 192.06 us | 13648.8 Mcell/s |
-| `field/vorticity/2048x1280` | 9.33 us |  |
-| `field/mean-velocity/2048x1280` | 4.74 us |  |
-| `lattice/total-particles/2048x1280` | 45.38 us | 57761.8 Mcell/s |
-| `lattice/mean-velocity/2048x1280` | 507.15 us | 5169.0 Mcell/s |
-| `render/write-vorticity/png` | 6.672 ms | 54.8 Mpx/s |
-| `render/write-arrows/svg` | 3.130 ms |  |
-| `collision/build/rest` | 9.11 us |  |
-| `collision/build/no-rest` | 3.53 us |  |
-| `lattice/init-equilibrium/2048x1280` | 17.057 ms | 153.7 Mcell/s |
-| `transport/measure/64` | 677.370 ms |  |
+| `step/512x512/t1` | 580.49 us | 451.6 Mcell/s |
+| `step/512x512/tN` | 177.85 us | 1473.9 Mcell/s |
+| `step/512x512/t1/no-rest` | 580.09 us | 451.9 Mcell/s |
+| `step/512x512/tN/plate` | 178.00 us | 1472.7 Mcell/s |
+| `step/512x512/tN/inlet` | 210.08 us | 1247.8 Mcell/s |
+| `step/2048x1280/t1` | 10.751 ms | 243.8 Mcell/s |
+| `step/2048x1280/tN` | 1.475 ms | 1776.7 Mcell/s |
+| `step/2048x64/tN` | 127.01 us | 1032.0 Mcell/s |
+| `step/gpu/2048x1280/one-per-submit` | 168.25 us | 15580.5 Mcell/s |
+| `step/gpu/2048x1280/batched` | 3.228 ms | 81213.5 Mcell/s |
+| `step/gpu/2048x1280/batched+inlet` | 4.520 ms | 58000.4 Mcell/s |
+| `step/gpu/2048x1280/batched+inlet+sample` | 4.765 ms | 55009.3 Mcell/s |
+| `field/gpu/sample/2048x1280` | 139.64 us | 18772.8 Mcell/s |
+| `lattice/gpu/total-particles/2048x1280` | 165.16 us | 15871.8 Mcell/s |
+| `field/sample/2048x1280` | 175.28 us | 14955.5 Mcell/s |
+| `field/vorticity/2048x1280` | 9.16 us |  |
+| `field/mean-velocity/2048x1280` | 4.85 us |  |
+| `lattice/total-particles/2048x1280` | 45.08 us | 58148.6 Mcell/s |
+| `lattice/mean-velocity/2048x1280` | 512.67 us | 5113.3 Mcell/s |
+| `render/write-vorticity/png` | 6.661 ms | 54.9 Mpx/s |
+| `render/write-arrows/svg` | 3.053 ms |  |
+| `collision/build/rest` | 7.17 us |  |
+| `collision/build/no-rest` | 3.19 us |  |
+| `lattice/init-equilibrium/2048x1280` | 17.562 ms | 149.3 Mcell/s |
+| `transport/measure/64` | 661.232 ms |  |
 
 Numbers taken on a different machine are not comparable to these; re-record the
 baseline before using it, and say in the commit message which machine it came
