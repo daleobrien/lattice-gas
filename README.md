@@ -11,6 +11,12 @@ averaged over blocks of cells the gas behaves like a continuum fluid, and past
 an obstacle it separates, forms a recirculating wake, and then sheds a von
 Karman vortex street.
 
+![Vorticity in the wake of a plate](docs/vortex-street.png)
+
+*Vorticity after 36,000 steps on a 2048 x 1280 lattice, at a Reynolds number
+near 100. Blue and red are the two senses of rotation; the black bar is the
+plate.*
+
 ## Build and run
 
 ```bash
@@ -29,6 +35,11 @@ Each frame is written twice: `vorticity-NNNN.png`, a colour map of the
 vorticity (blue and red for the two senses of rotation), and
 `arrows-NNNN.svg`, a velocity-arrow plot in the style of the book's figure,
 with the mean flow subtracted so the fluid is at rest and the obstacle moves.
+
+![Velocity arrows](docs/velocity-arrows.svg)
+
+*The same instant as an arrow plot. With the mean flow subtracted the plate is
+the thing that is moving, which is how the book presents it.*
 
 `--help` lists every option. To turn the frames into a movie, if you have
 ffmpeg:
