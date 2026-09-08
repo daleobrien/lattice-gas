@@ -152,6 +152,13 @@ number on about a sixth as many cells.
   without stationary particles.
 * The PNG writer's deflate output round-trips through a matching decoder.
 
+`tests/golden.rs` adds the checks that matter when optimising rather than when
+writing: that a fixed run still produces the same lattice bit for bit, that it
+produces the same answer twice running, and that mass and momentum come out
+exactly equal however the rows are divided between threads. A change to the
+order of the random draws trips the first of those and none of the others,
+which is the signal that the stream moved but the fluid did not.
+
 Two things fall out of the physics rather than the tests: the advection factor
 matches the FHP prediction across the whole density range, as described above,
 and the wake sheds at a Strouhal number of about 0.11, which is the right range

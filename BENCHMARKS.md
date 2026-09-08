@@ -8,9 +8,39 @@ and reports the change against it, so the loop for a performance change is:
 ```bash
 cargo bench                       # where are we now, against the baseline?
 # ... make the change ...
-cargo test                        # the physics must still hold
+cargo test                        # did the answer change, and did it matter?
 cargo bench                       # what moved, and by how much?
 ```
+
+`tests/golden.rs` is the half of that loop that is easy to skip and expensive
+to skip. It answers two separate questions:
+
+* **Did the output change at all?** `golden_output_is_unchanged` checksums the
+  cell array and the coarse-grained field after a fixed run from a fixed seed.
+  Widening the collision loop to SIMD, or re-banding the threads, changes the
+  order of the random draws and so changes these checksums. That is allowed --
+  but it should be a decision, not a surprise.
+* **Did the fluid change?** `physics_is_unchanged` checks mean velocity and
+  particle count against tolerances wide enough that a completely different
+  random stream sails through them. `stepping_is_deterministic` runs each case
+  twice and demands the same answer, which is what catches a race introduced by
+  letting threads touch more than their own rows. And because collisions
+  conserve mass and momentum exactly,
+  `thread_count_does_not_change_conserved_quantities` holds those two exactly
+  equal across one, two, three, five and eight threads -- an invariant no
+  reordering of the random draws can excuse breaking.
+
+So the reading is: layer one alone failing means *you moved the random stream*,
+and you should confirm you meant to and regenerate the table. Either of the
+others failing means *you broke the simulation*. To regenerate after a
+deliberate change:
+
+```bash
+cargo test --test golden -- --ignored --nocapture print_golden
+```
+
+and paste the printed block over `GOLDEN` in `tests/golden.rs`, saying in the
+commit message why the stream moved. The whole file runs in about 1.5 s.
 
 Only re-record the baseline once a change is settled and committed:
 
