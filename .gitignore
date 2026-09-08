@@ -1,0 +1,7 @@
+/target
+/out
+*.log
+scan-*.txt
+.DS_Store
+target.tmp
+target
