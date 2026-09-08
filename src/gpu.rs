@@ -1,0 +1,618 @@
+//! The lattice on the GPU, stored as bitplanes.
+//!
+//! The byte-per-cell update in `lattice.rs` spends its time on a table lookup
+//! and a random draw *per cell*. Packed as bitplanes --- one bit per cell, 32
+//! cells to a `uint`, a separate plane per direction --- propagation becomes a
+//! shift of whole words and collision becomes Boolean algebra evaluated on 32
+//! cells at once. One random word then feeds 32 cells instead of one.
+//!
+//! The collision rule is not hand-written. It is emitted, at startup, from the
+//! same `collision::classes` enumeration the CPU lookup table is built from:
+//! for each momentum class, a term that recognises the class and a selector
+//! that picks uniformly among its members. That way the two implementations
+//! cannot drift into describing different physics, and
+//! `the_shader_rule_matches_the_enumeration` checks the emitted circuit against
+//! the enumeration for every state and every draw.
+
+use crate::collision;
+use crate::hex::{NDIR, REST_BIT, SOLID_BIT};
+use crate::metal::{Buffer, Device, Pipeline};
+
+/// Cells per word. `uint` is what an Apple GPU wants to move and operate on.
+const BITS: usize = 32;
+/// Direction planes, plus the rest plane. The solid plane lives on its own,
+/// outside the ping-pong, because it never changes.
+const PLANES: usize = NDIR + 1;
+
+// ---------------------------------------------------------------------------
+// Emitting the collision rule
+// ---------------------------------------------------------------------------
+
+/// The Boolean circuit for one collision, as Metal source.
+///
+/// Classes of size 2, 3 and 5 need a fair bit, a uniform choice of three and a
+/// uniform choice of five. Those arrive as one-hot selectors; when a selector
+/// is all zero the cell is simply left alone, which is what the rejection
+/// sampling in the shader does when it runs out of rounds. Leaving a state put
+/// with some fixed probability keeps the transition matrix doubly stochastic,
+/// so semi-detailed balance --- and with it the equilibrium --- is untouched.
+pub fn collide_source(rest_particles: bool) -> String {
+    let nbits = if rest_particles { 7 } else { 6 };
+    let classes: Vec<Vec<u8>> = collision::classes(rest_particles)
+        .into_iter()
+        .filter(|g| g.len() > 1)
+        .collect();
+    for g in &classes {
+        assert!(
+            matches!(g.len(), 2 | 3 | 5),
+            "no selector for a class of {} states; the shader knows about 2, 3 and 5",
+            g.len()
+        );
+    }
+
+    let mut needed: Vec<u8> = classes.iter().flatten().copied().collect();
+    needed.sort_unstable();
+
+    let mut s = String::new();
+    s.push_str(
+        "inline void collide(thread uint n[7], uint s2, thread uint s3[3],\n\
+         \x20                   thread uint s5[5], thread uint o[7]) {\n",
+    );
+    for d in 0..7 {
+        s.push_str(&format!("  uint n{d} = n[{d}];\n"));
+    }
+    for d in 0..nbits {
+        s.push_str(&format!("  uint c{d} = ~n{d};\n"));
+    }
+    s.push_str("  uint t2[2]; t2[0] = s2; t2[1] = ~s2;\n");
+
+    // A product tree over the state bits, so states that share a prefix share
+    // the work. Branches that no class needs are never built.
+    let mut frontier: Vec<(u8, String)> = vec![(0, String::new())];
+    for level in 0..nbits {
+        let mask: u8 = ((1u16 << (level + 1)) - 1) as u8;
+        let mut next = Vec::new();
+        for (val, expr) in &frontier {
+            for bit in 0..2u8 {
+                let nv = val | (bit << level);
+                if !needed.iter().any(|&st| st & mask == nv) {
+                    continue;
+                }
+                let lit = if bit == 1 { format!("n{level}") } else { format!("c{level}") };
+                if level == 0 {
+                    next.push((nv, lit));
+                } else {
+                    let name = format!("t{}_{}", level + 1, nv);
+                    s.push_str(&format!("  uint {name} = {expr} & {lit};\n"));
+                    next.push((nv, name));
+                }
+            }
+        }
+        frontier = next;
+    }
+    let term = |st: u8| -> &str {
+        &frontier.iter().find(|(v, _)| *v == st).expect("state in the tree").1
+    };
+
+    let mut out: Vec<Vec<String>> = vec![Vec::new(); 7];
+    let mut acted: Vec<String> = Vec::new();
+    for (ci, g) in classes.iter().enumerate() {
+        let sel = match g.len() {
+            2 => "t2",
+            3 => "s3",
+            _ => "s5",
+        };
+        let members: Vec<String> = g.iter().map(|&st| term(st).to_string()).collect();
+        s.push_str(&format!("  uint i{ci} = {};\n", members.join(" | ")));
+        let any: Vec<String> = (0..g.len()).map(|k| format!("{sel}[{k}]")).collect();
+        s.push_str(&format!("  uint r{ci} = i{ci} & ({});\n", any.join(" | ")));
+        acted.push(format!("r{ci}"));
+        for (k, &member) in g.iter().enumerate() {
+            s.push_str(&format!("  uint p{ci}_{k} = i{ci} & {sel}[{k}];\n"));
+            for d in 0..7 {
+                if member & (1 << d) != 0 {
+                    out[d].push(format!("p{ci}_{k}"));
+                }
+            }
+        }
+    }
+
+    s.push_str(&format!("  uint keep = ~({});\n", acted.join(" | ")));
+    for d in 0..7 {
+        if d >= nbits {
+            s.push_str(&format!("  o[{d}] = n{d};\n"));
+        } else if out[d].is_empty() {
+            s.push_str(&format!("  o[{d}] = n{d} & keep;\n"));
+        } else {
+            s.push_str(&format!("  o[{d}] = (n{d} & keep) | {};\n", out[d].join(" | ")));
+        }
+    }
+    s.push_str("}\n");
+    s
+}
+
+/// Everything but the collision: propagation, walls, the draws, and a kernel
+/// that exists only so the tests can check the emitted rule.
+const KERNELS: &str = r#"
+// A hash with good avalanche, so that neighbouring cells and consecutive steps
+// get uncorrelated draws from a cheap stateless source.
+inline uint mix(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16; return x;
+}
+
+// One-hot selectors. Rejection sampling: each round resolves the lanes it can
+// and leaves the rest for the next one. A lane still unresolved at the end
+// keeps its state, which is a fixed probability and so still doubly
+// stochastic.
+inline void draws(uint seed, thread uint& s2, thread uint s3[3], thread uint s5[5]) {
+    uint r = mix(seed);
+    s2 = r;
+    s3[0] = 0u; s3[1] = 0u; s3[2] = 0u;
+    uint open = 0xffffffffu;
+    for (int k = 0; k < 3; ++k) {
+        r = mix(r); uint a = r; r = mix(r); uint b = r;
+        s3[0] |= open & ~a & ~b;
+        s3[1] |= open &  a & ~b;
+        s3[2] |= open & ~a &  b;
+        open  &= a & b;
+    }
+    s5[0] = 0u; s5[1] = 0u; s5[2] = 0u; s5[3] = 0u; s5[4] = 0u;
+    uint open5 = 0xffffffffu;
+    for (int k = 0; k < 4; ++k) {
+        r = mix(r); uint a = r; r = mix(r); uint b = r; r = mix(r); uint c = r;
+        s5[0] |= open5 & ~a & ~b & ~c;
+        s5[1] |= open5 &  a & ~b & ~c;
+        s5[2] |= open5 & ~a &  b & ~c;
+        s5[3] |= open5 &  a &  b & ~c;
+        s5[4] |= open5 & ~a & ~b &  c;
+        open5 &= c & (a | b);
+    }
+}
+
+// P: 0 wpr, 1 h, 2 seed, 3 lastword, 4 lastbit, 5 tailmask, 6 total
+kernel void lgca_step(device const uint* a     [[buffer(0)]],
+                      device uint* b           [[buffer(1)]],
+                      device const uint* solid [[buffer(2)]],
+                      constant uint* P         [[buffer(3)]],
+                      uint gid [[thread_position_in_grid]]) {
+    uint wpr = P[0], hh = P[1], total = P[6];
+    if (gid >= total) return;
+    uint y = gid / wpr, j = gid - y * wpr;
+    uint lastword = P[3], lastbit = P[4];
+
+    const int DXE[6] = {1, 0, -1, -1, -1, 0};
+    const int DXO[6] = {1, 1,  0, -1,  0, 1};
+    const int DY[6]  = {0, 1,  1,  0, -1, -1};
+    const int OPP[6] = {3, 4, 5, 0, 1, 2};
+
+    uint n[7];
+    for (uint d = 0; d < 6; ++d) {
+        int bk = OPP[d];
+        int dx = (y & 1u) ? DXO[bk] : DXE[bk];
+        int sy = int(y) + DY[bk];
+        if (sy < 0) sy += int(hh);
+        if (sy >= int(hh)) sy -= int(hh);
+        uint base = d * total + uint(sy) * wpr;
+        uint w = a[base + j];
+        uint v;
+        if (dx == 0) {
+            v = w;
+        } else if (dx > 0) {
+            // bit x takes bit x+1
+            uint hi = (j + 1u < wpr) ? a[base + j + 1u] : 0u;
+            v = (w >> 1) | (hi << 31);
+            if (j == lastword) {                       // the one bit that wraps
+                v = (v & ~(1u << lastbit)) | ((a[base] & 1u) << lastbit);
+            }
+        } else {
+            // bit x takes bit x-1
+            uint lo = (j > 0u) ? a[base + j - 1u] : 0u;
+            v = (w << 1) | (lo >> 31);
+            if (j == 0u) {
+                v = (v & ~1u) | ((a[base + lastword] >> lastbit) & 1u);
+            }
+        }
+        n[d] = v;
+    }
+    n[6] = a[6u * total + y * wpr + j];               // rest particles do not move
+
+    uint s2; uint s3[3]; uint s5[5];
+    draws(gid ^ P[2], s2, s3, s5);
+    uint o[7];
+    collide(n, s2, s3, s5, o);
+
+    // A wall sends every particle back the way it came, and never collides.
+    uint sm = solid[y * wpr + j];
+    uint fluid = ~sm;
+    uint res[7];
+    for (uint d = 0; d < 6; ++d) res[d] = (sm & n[(d + 3u) % 6u]) | (fluid & o[d]);
+    res[6] = (sm & n[6]) | (fluid & o[6]);
+
+    uint mask = (j == lastword) ? P[5] : 0xffffffffu;
+    for (uint d = 0; d < 7; ++d) b[d * total + y * wpr + j] = res[d] & mask;
+}
+
+// Exists so a test can check the emitted circuit itself, rather than a
+// transliteration of it. Each thread is one (state, draw) combination.
+kernel void lgca_verify(device uint* out [[buffer(0)]],
+                        constant uint* P [[buffer(1)]],
+                        uint i [[thread_position_in_grid]]) {
+    if (i >= P[0]) return;
+    uint five = i % 6u, three = (i / 6u) % 4u, two = (i / 24u) % 2u, state = i / 48u;
+    uint n[7];
+    for (uint d = 0; d < 7; ++d) n[d] = ((state >> d) & 1u) ? 0xffffffffu : 0u;
+    uint s3[3] = {0u, 0u, 0u}, s5[5] = {0u, 0u, 0u, 0u, 0u};
+    if (three < 3u) s3[three] = 0xffffffffu;
+    if (five < 5u) s5[five] = 0xffffffffu;
+    uint o[7];
+    collide(n, two ? 0xffffffffu : 0u, s3, s5, o);
+    uint r = 0u, bad = 0u;
+    for (uint d = 0; d < 7; ++d) {
+        if (o[d] == 0xffffffffu) r |= 1u << d;
+        else if (o[d] != 0u) bad = 1u;               // lanes must never disagree
+    }
+    out[i] = r | (bad << 16);
+}
+"#;
+
+// ---------------------------------------------------------------------------
+// The lattice
+// ---------------------------------------------------------------------------
+
+pub struct GpuLattice {
+    dev: Device,
+    step: Pipeline,
+    a: Buffer,
+    b: Buffer,
+    solid: Buffer,
+    pub w: usize,
+    pub h: usize,
+    wpr: usize,
+    total: usize,
+    pub steps: u64,
+    seed: u64,
+}
+
+impl GpuLattice {
+    pub fn new(w: usize, h: usize, rest_particles: bool, seed: u64) -> Result<Self, String> {
+        assert!(h % 2 == 0, "row count must be even for the lattice to wrap cleanly in y");
+        assert!(w > 4 && h > 4, "lattice is too small");
+        let dev = Device::new().ok_or("no Metal device on this machine")?;
+        let source = format!("#include <metal_stdlib>\nusing namespace metal;\n{}{}",
+                             collide_source(rest_particles), KERNELS);
+        let step = dev.pipeline(&source, "lgca_step")?;
+        let wpr = w.div_ceil(BITS);
+        let total = wpr * h;
+        let a = dev.buffer(total * PLANES * 4);
+        let b = dev.buffer(total * PLANES * 4);
+        let solid = dev.buffer(total * 4);
+        Ok(GpuLattice { dev, step, a, b, solid, w, h, wpr, total, steps: 0, seed })
+    }
+
+    pub fn device_name(&self) -> String {
+        self.dev.name()
+    }
+
+    fn params(&self) -> [u32; 7] {
+        let lastword = ((self.w - 1) / BITS) as u32;
+        let lastbit = ((self.w - 1) % BITS) as u32;
+        let tail = if lastbit == 31 { u32::MAX } else { (1u32 << (lastbit + 1)) - 1 };
+        [
+            self.wpr as u32,
+            self.h as u32,
+            (self.seed ^ self.steps.wrapping_mul(0x9E37_79B9_7F4A_7C15)) as u32,
+            lastword,
+            lastbit,
+            tail,
+            self.total as u32,
+        ]
+    }
+
+    /// Spread a byte-per-cell lattice across the planes. `SOLID_BIT` goes to
+    /// its own buffer, since it does not take part in the ping-pong.
+    pub fn load(&mut self, cells: &[u8]) {
+        assert_eq!(cells.len(), self.w * self.h, "wrong number of cells");
+        let (w, wpr, total) = (self.w, self.wpr, self.total);
+        for v in self.a.as_mut_slice::<u32>().iter_mut() {
+            *v = 0;
+        }
+        for v in self.solid.as_mut_slice::<u32>().iter_mut() {
+            *v = 0;
+        }
+        let planes = self.a.as_mut_slice::<u32>();
+        let solid = self.solid.as_mut_slice::<u32>();
+        for y in 0..self.h {
+            for x in 0..w {
+                let c = cells[y * w + x];
+                let word = y * wpr + x / BITS;
+                let bit = 1u32 << (x % BITS);
+                for d in 0..NDIR {
+                    if c & (1 << d) != 0 {
+                        planes[d * total + word] |= bit;
+                    }
+                }
+                if c & REST_BIT != 0 {
+                    planes[NDIR * total + word] |= bit;
+                }
+                if c & SOLID_BIT != 0 {
+                    solid[word] |= bit;
+                }
+            }
+        }
+    }
+
+    /// Gather the planes back into one byte per cell.
+    pub fn store(&self, cells: &mut [u8]) {
+        assert_eq!(cells.len(), self.w * self.h, "wrong number of cells");
+        let (w, wpr, total) = (self.w, self.wpr, self.total);
+        let planes = self.a.as_slice::<u32>();
+        let solid = self.solid.as_slice::<u32>();
+        for y in 0..self.h {
+            for x in 0..w {
+                let word = y * wpr + x / BITS;
+                let bit = 1u32 << (x % BITS);
+                let mut c = 0u8;
+                for d in 0..NDIR {
+                    if planes[d * total + word] & bit != 0 {
+                        c |= 1 << d;
+                    }
+                }
+                if planes[NDIR * total + word] & bit != 0 {
+                    c |= REST_BIT;
+                }
+                if solid[word] & bit != 0 {
+                    c |= SOLID_BIT;
+                }
+                cells[y * w + x] = c;
+            }
+        }
+    }
+
+    /// Run `n` steps. They all go into one command buffer, so the GPU is asked
+    /// once rather than `n` times --- a round trip costs more than a step does.
+    pub fn advance(&mut self, n: u64) {
+        const PER_BATCH: u64 = 100;
+        let mut left = n;
+        while left > 0 {
+            let take = left.min(PER_BATCH);
+            let mut batch = self.dev.batch();
+            for _ in 0..take {
+                let p = self.params();
+                let (src, dst) = (&self.a, &self.b);
+                batch.dispatch(&self.step, &[src, dst, &self.solid], &p, self.total as u64);
+                std::mem::swap(&mut self.a, &mut self.b);
+                self.steps += 1;
+            }
+            batch.wait();
+            left -= take;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collision::classes;
+    use crate::hex::{CX2, CY2, DX_EVEN, DX_ODD, DY, MOVING_MASK, STATE_MASK};
+    use crate::lattice::Lattice;
+    use crate::rng::Rng;
+
+    fn device_or_skip() -> bool {
+        if Device::new().is_none() {
+            eprintln!("no Metal device; skipping");
+            return false;
+        }
+        true
+    }
+
+    /// The circuit the GPU actually runs, checked against the enumeration it
+    /// was emitted from, for every state and every draw.
+    #[test]
+    fn the_shader_rule_matches_the_enumeration() {
+        if !device_or_skip() {
+            return;
+        }
+        for &rest in &[true, false] {
+            let dev = Device::new().unwrap();
+            let src = format!("#include <metal_stdlib>\nusing namespace metal;\n{}{}",
+                              collide_source(rest), KERNELS);
+            let pso = dev.pipeline(&src, "lgca_verify").expect("verify pipeline");
+            let n_states: usize = if rest { 128 } else { 64 };
+            let n = n_states * 48;
+            let out = dev.buffer(n * 4);
+            let mut batch = dev.batch();
+            batch.dispatch(&pso, &[&out], &[n as u32], n as u64);
+            batch.wait();
+
+            let mut class_of = vec![Vec::new(); 128];
+            for g in classes(rest) {
+                for &s in &g {
+                    class_of[s as usize] = g.clone();
+                }
+            }
+            let got = out.as_slice::<u32>();
+            for i in 0..n {
+                let (five, three, two, state) =
+                    (i % 6, (i / 6) % 4, (i / 24) % 2, (i / 48) as u8);
+                assert_eq!(got[i] >> 16, 0, "lanes disagreed on state {state:07b}");
+                let g = &class_of[state as usize];
+                let want = if g.len() == 1 {
+                    state
+                } else {
+                    match g.len() {
+                        2 => g[if two == 1 { 0 } else { 1 }],
+                        3 => if three < 3 { g[three] } else { state },
+                        5 => if five < 5 { g[five] } else { state },
+                        _ => unreachable!(),
+                    }
+                };
+                assert_eq!(
+                    got[i] as u8, want,
+                    "rest={rest} state {state:07b} two={two} three={three} five={five}"
+                );
+            }
+        }
+    }
+
+    /// A lone particle has no collision partner, so it must fly straight. This
+    /// is the propagation test from `lattice.rs`, run on the GPU, and it pins
+    /// down the shifts and the wrap for both row parities.
+    #[test]
+    fn a_single_particle_travels_in_a_straight_line() {
+        if !device_or_skip() {
+            return;
+        }
+        // A width that is not a multiple of the word size, to exercise the tail.
+        for w in [64usize, 80] {
+            for d in 0..NDIR {
+                for start_row in [10usize, 11] {
+                    let (h, steps) = (48usize, 8usize);
+                    let mut g = GpuLattice::new(w, h, true, 1).expect("gpu lattice");
+                    let mut cells = vec![0u8; w * h];
+                    let (x0, y0) = (24usize, start_row);
+                    cells[y0 * w + x0] = 1 << d;
+                    g.load(&cells);
+                    g.advance(steps as u64);
+                    g.store(&mut cells);
+
+                    let live: Vec<usize> =
+                        (0..cells.len()).filter(|&i| cells[i] & STATE_MASK != 0).collect();
+                    assert_eq!(live.len(), 1, "w={w} direction {d}: particle was lost");
+                    assert_eq!(cells[live[0]], 1 << d, "w={w} direction {d}: it turned");
+
+                    // Walk the expected path with the same offsets the CPU uses.
+                    let (mut x, mut y) = (x0 as i32, y0 as i32);
+                    for _ in 0..steps {
+                        let dx = if y & 1 == 1 { DX_ODD[d] } else { DX_EVEN[d] };
+                        x = (x + dx).rem_euclid(w as i32);
+                        y = (y + DY[d]).rem_euclid(h as i32);
+                    }
+                    assert_eq!(
+                        live[0],
+                        (y as usize) * w + x as usize,
+                        "w={w} direction {d} from row {start_row}: wrong destination"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A particle that runs into a wall comes back the way it came.
+    #[test]
+    fn walls_reverse_particles() {
+        if !device_or_skip() {
+            return;
+        }
+        let (w, h) = (64usize, 48usize);
+        let mut g = GpuLattice::new(w, h, true, 1).unwrap();
+        let mut cells = vec![0u8; w * h];
+        let (x0, y0) = (20usize, 24usize);
+        cells[y0 * w + x0 + 3] = SOLID_BIT;
+        cells[y0 * w + x0] = 1; // heading east
+        g.load(&cells);
+        g.advance(6);
+        g.store(&mut cells);
+        let live: Vec<usize> =
+            (0..cells.len()).filter(|&i| cells[i] & STATE_MASK != 0).collect();
+        assert_eq!(live.len(), 1);
+        assert_eq!(cells[live[0]] & STATE_MASK, 1 << 3, "should now head west");
+        assert_eq!(live[0], y0 * w + x0, "should be back where it started");
+    }
+
+    /// Collisions conserve mass and momentum exactly, so a periodic box must
+    /// hold both fixed however many steps it runs.
+    #[test]
+    fn a_periodic_box_conserves_mass_and_momentum() {
+        if !device_or_skip() {
+            return;
+        }
+        for &rest in &[true, false] {
+            let (w, h) = (128usize, 64usize);
+            let mut g = GpuLattice::new(w, h, rest, 0xC0FFEE).unwrap();
+            let mut cells = vec![0u8; w * h];
+            let mut rng = Rng::new(7);
+            for c in cells.iter_mut() {
+                *c = (rng.next_u32() as u8) & if rest { STATE_MASK } else { MOVING_MASK };
+            }
+            let totals = |cs: &[u8]| {
+                let (mut m, mut px, mut py) = (0i64, 0i64, 0i64);
+                for &c in cs {
+                    for d in 0..NDIR {
+                        if c & (1 << d) != 0 {
+                            m += 1;
+                            px += CX2[d] as i64;
+                            py += CY2[d] as i64;
+                        }
+                    }
+                    if c & REST_BIT != 0 {
+                        m += 1;
+                    }
+                }
+                (m, px, py)
+            };
+            let before = totals(&cells);
+            g.load(&cells);
+            g.advance(250);
+            g.store(&mut cells);
+            assert_eq!(before, totals(&cells), "rest = {rest}");
+        }
+    }
+
+    /// Packing and unpacking has to be the identity, including on a width that
+    /// leaves a partly used word at the end of every row.
+    #[test]
+    fn load_and_store_round_trip() {
+        if !device_or_skip() {
+            return;
+        }
+        for w in [64usize, 100] {
+            let h = 16usize;
+            let mut g = GpuLattice::new(w, h, true, 1).unwrap();
+            let mut rng = Rng::new(11);
+            let want: Vec<u8> = (0..w * h)
+                .map(|_| {
+                    let b = rng.next_u32() as u8;
+                    if b & 0x80 != 0 { SOLID_BIT } else { b & STATE_MASK }
+                })
+                .collect();
+            g.load(&want);
+            let mut got = vec![0u8; w * h];
+            g.store(&mut got);
+            assert_eq!(want, got, "w={w}");
+        }
+    }
+
+    /// The GPU is a second implementation of the same model, so it should
+    /// reproduce the CPU's statistics even though the random streams differ.
+    #[test]
+    fn the_gpu_agrees_with_the_cpu_on_the_bulk_numbers() {
+        if !device_or_skip() {
+            return;
+        }
+        let (w, h) = (256usize, 128usize);
+        let mut cpu = Lattice::new(w, h, 0.22, (0.3, 0.0), 0, true, 4, 0x5EED);
+        cpu.init_equilibrium();
+        let start = cpu.cells.clone();
+
+        let mut g = GpuLattice::new(w, h, true, 0x5EED).unwrap();
+        g.load(&start);
+        cpu.advance(120);
+        g.advance(120);
+        let mut gcells = vec![0u8; w * h];
+        g.store(&mut gcells);
+
+        let gpu_lat = {
+            let mut l = Lattice::new(w, h, 0.22, (0.3, 0.0), 0, true, 1, 1);
+            l.cells.copy_from_slice(&gcells);
+            l
+        };
+        let (ax, ay) = cpu.mean_velocity();
+        let (bx, by) = gpu_lat.mean_velocity();
+        let (ma, mb) = (cpu.total_particles() as f64, gpu_lat.total_particles() as f64);
+        assert!((ax - bx).abs() < 0.02 && (ay - by).abs() < 0.02,
+                "mean velocity: cpu ({ax:.4}, {ay:.4}) gpu ({bx:.4}, {by:.4})");
+        assert!((ma - mb).abs() / ma < 0.01, "particle count: cpu {ma}, gpu {mb}");
+    }
+}

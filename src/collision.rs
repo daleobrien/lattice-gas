@@ -10,7 +10,7 @@
 //! favourable.
 
 use crate::hex::{CX2, CY2, NDIR, REST_BIT};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 pub struct CollisionTable {
     /// Outcomes per state, padded to a common width so that a uniform draw
@@ -51,11 +51,28 @@ fn invariants(state: u8) -> (u32, i32, i32) {
     (mass, px, py)
 }
 
+/// The momentum classes: every state grouped with the ones a collision is
+/// allowed to turn it into.
+///
+/// This is the single enumeration the rule comes from. The lookup table below
+/// is built from it, and so is the Boolean circuit the GPU runs, so the two
+/// cannot end up describing different physics. Ordering is deterministic ---
+/// classes by invariant, states within a class ascending --- because the
+/// generated circuit is laid out from it.
+pub fn classes(rest_particles: bool) -> Vec<Vec<u8>> {
+    let n_states = if rest_particles { 128usize } else { 64 };
+    let mut groups: BTreeMap<(u32, i32, i32), Vec<u8>> = BTreeMap::new();
+    for s in 0..n_states {
+        groups.entry(invariants(s as u8)).or_default().push(s as u8);
+    }
+    groups.into_values().collect()
+}
+
 impl CollisionTable {
     pub fn build(rest_particles: bool) -> Self {
         let n_states = if rest_particles { 128 } else { 64 };
 
-        let mut groups: HashMap<(u32, i32, i32), Vec<u8>> = HashMap::new();
+        let mut groups: BTreeMap<(u32, i32, i32), Vec<u8>> = BTreeMap::new();
         for s in 0..n_states {
             groups.entry(invariants(s as u8)).or_default().push(s as u8);
         }

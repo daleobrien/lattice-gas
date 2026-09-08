@@ -149,9 +149,110 @@ within noise. That is a quantitative check on a rewrite that changes every
 random draw in the program. Keep the byte kernel as the reference
 implementation.
 
-**Effect on the default run: ~1.4 min -> ~10 s (about 30x overall).**
+### What the collision actually costs --- measured, and it changes the plan
 
-## Phase 3 --- Metal, if bigger runs are wanted
+The rule turned out to be far more tractable to *derive* than expected and far
+more expensive to *run* than expected.
+
+Enumerating the momentum classes gives only **eight non-singleton class types**
+up to the twelve-element symmetry group: two of size 5, four of size 3, two of
+size 2, covering 28 classes and 76 of the 128 states. A generator walks that
+enumeration --- the same one `collision.rs` already does at runtime, so the two
+cannot drift --- and emits the exact rule as Boolean logic over the seven
+planes, given a fair bit, a 1-of-3 selector and a 1-of-5 selector. Rejection
+sampling supplies the last two, leaving a lane unresolved (and so unchanged)
+1.6% and 2.0% of the time, which is doubly stochastic and therefore still sound
+physics. It verifies exhaustively: all 6,144 (state, draw) combinations come out
+uniform over the class and conserving.
+
+It costs 685 boolean operators after sharing the minterm prefix tree, and that
+is the problem:
+
+| At 2048x1280 | ms/step | against today |
+| --- | ---: | ---: |
+| today, byte per cell, 12 threads | 1.521 | --- |
+| CPU bitplane, exact rule, 12 threads | 0.441 | 3.4x |
+| GPU, exact rule, 100 steps per command buffer | **0.034** | **45x** |
+
+**The CPU version is register-bound, not ALU-bound.** Widening the word from
+one `u64` to two and then four made it *slower* --- 2.68, 2.89, 3.24 ms on one
+thread --- because the live values spill. Sharing the minterm tree cut the
+operator count 29% and bought almost nothing, because the compiler was already
+doing that CSE. There is no obvious further factor of two on the CPU.
+
+**The GPU barely noticed the real rule**: 0.011 ms/step with a toy FHP-I
+collision, 0.034 ms with the exact one, propagation shifts included. It has the
+registers and the ALUs that twelve CPU cores do not.
+
+So the ordering in this document was wrong, and it was wrong for a reason worth
+recording: **the GPU is the third-best idea only when the collision is cheap.**
+The measurement that put it third was a bandwidth argument, and it was correct
+for the rule it was measured with. The actual maximal rule is compute-bound,
+and compute is precisely where the shared memory controller stops mattering.
+
+**Effect on the default run: CPU bitplane takes ~1.4 min to ~25 s (3.3x).
+Going to Metal with the same rule takes it to ~4 s (about 20x).**
+
+## Phase 3 --- Metal --- in progress
+
+Promoted ahead of the CPU bitplane rewrite on the strength of the measurement
+above: same rule, 3.4x on twelve cores against 45x on the GPU.
+
+### Landed
+
+* [`src/metal.rs`](src/metal.rs) --- a hand-rolled Metal binding. Metal has no C
+  API, but `objc_msgSend` is an ordinary C symbol, so the whole thing is a few
+  typed casts of it. `Cargo.lock` is still empty. Buffers are shared rather
+  than private, which on Apple silicon means the CPU and GPU address one
+  allocation and the analysis passes need no transfer --- and it measures the
+  same as private storage.
+* [`src/gpu.rs`](src/gpu.rs) --- the lattice as bitplanes, 32 cells to a `uint`,
+  seven planes plus a solid plane that sits outside the ping-pong because it
+  never changes. Propagation is a shift with a carry from the neighbouring
+  word, plus a fix-up for the one bit per row that wraps, so widths that are
+  not a multiple of 32 work too.
+* The collision circuit is **emitted at startup from `collision::classes`**,
+  the same enumeration the CPU lookup table is built from. Neither is
+  hand-written, so they cannot drift into describing different physics.
+
+### Measured
+
+| At 2048x1280 | ms/step | against the CPU |
+| --- | ---: | ---: |
+| CPU, byte per cell, 12 threads | 1.504 | --- |
+| GPU, one step per command buffer | 0.201 | 7.5x |
+| GPU, 100 steps per command buffer | **0.0345** | **43.6x** |
+
+The two GPU rows are the same work submitted two ways. A round trip costs more
+than seven steps do, which is the design constraint the rest of this phase has
+to respect.
+
+### Checked
+
+Six tests, all of which run the shader that ships rather than a
+transliteration of it:
+
+* `the_shader_rule_matches_the_enumeration` runs the emitted circuit over every
+  state and every draw --- 6,144 combinations for FHP-III, 3,072 for the
+  six-direction model --- and checks each against the class it came from.
+* `a_single_particle_travels_in_a_straight_line` covers all six directions,
+  both row parities, and a width of 80 so that the ragged last word is
+  exercised.
+* `walls_reverse_particles`, `a_periodic_box_conserves_mass_and_momentum` over
+  250 steps, `load_and_store_round_trip` on a width of 100, and a bulk
+  comparison against the CPU.
+
+### Still to do
+
+* Coarse-graining as a GPU kernel, so a frame does not force a round trip every
+  fifth step.
+* The inlet re-seed, which is 44% of a step at this speed if it stays on the CPU.
+* Driving `transport::measure` from the GPU path, and with it the acceptance
+  test: nu and g must still come out at 0.2989 and 0.440.
+* Wiring into `main.rs`, with the CPU path kept as the reference the golden
+  tests run against.
+
+### Notes from building it
 
 About a week, and optional.
 

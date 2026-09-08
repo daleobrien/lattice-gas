@@ -10,6 +10,10 @@
 pub mod collision;
 pub mod hex;
 pub mod lattice;
+#[cfg(target_os = "macos")]
+pub mod gpu;
+#[cfg(target_os = "macos")]
+pub mod metal;
 pub mod moments;
 pub mod png;
 pub mod render;

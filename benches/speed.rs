@@ -469,6 +469,42 @@ fn main() {
         |l| l.step(),
     );
 
+    // --- the GPU path ------------------------------------------------------
+    //
+    // A round trip to the GPU costs more than a step does, so the two cases
+    // below are the same work submitted two ways: one step per command buffer,
+    // and a hundred. The gap between them is the whole design constraint.
+    #[cfg(target_os = "macos")]
+    {
+        use lattice_gas::gpu::GpuLattice;
+        if lattice_gas::metal::Device::new().is_some() {
+            let build = |steps: u64| {
+                move || {
+                    let seed = lattice_gas::lattice::Lattice::new(
+                        bw, bh, DENSITY, (SPEED, 0.0), 0, true, 1, SEED,
+                    );
+                    let mut seed_cells = seed;
+                    seed_cells.init_equilibrium();
+                    let mut g = GpuLattice::new(bw, bh, true, SEED).expect("gpu lattice");
+                    g.load(&seed_cells.cells);
+                    (g, steps)
+                }
+            };
+            r.bench(
+                "step/gpu/2048x1280/one-per-submit",
+                cells(bw * bh),
+                build(1),
+                |(g, n)| g.advance(*n),
+            );
+            r.bench(
+                "step/gpu/2048x1280/batched",
+                cells(bw * bh * 100),
+                build(100),
+                |(g, n)| g.advance(*n),
+            );
+        }
+    }
+
     // --- coarse-graining and analysis --------------------------------------
     //
     // `Field::sample` runs every `--sample-every` steps (5 by default), so its
