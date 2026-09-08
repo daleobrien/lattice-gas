@@ -14,7 +14,7 @@
 //! across them and adds, while the fluctuations are zero-mean and cancel.
 
 use crate::hex::{CXF, CYF, NDIR, REST_BIT, SQRT3_2};
-use crate::lattice::{equilibrium_sample, Lattice};
+use crate::lattice::{Equilibrium, Lattice};
 use crate::rng::Rng;
 use std::f64::consts::PI;
 
@@ -167,8 +167,9 @@ pub fn viscosity(density: f32, rest: bool, threads: usize, seed: u64, size: usiz
         let mut rng = Rng::new(s ^ 0xBEEF);
         for y in 0..h {
             let ux = amp * (k * y as f32 * SQRT3_2).sin();
+            let eq = Equilibrium::new(density, ux, 0.0, rest);
             for x in 0..w {
-                lat.cells[y * w + x] = equilibrium_sample(density, ux, 0.0, rest, &mut rng);
+                lat.cells[y * w + x] = eq.sample(&mut rng);
             }
         }
         lat
@@ -206,10 +207,12 @@ pub fn advection_factor(density: f32, rest: bool, threads: usize, seed: u64, siz
         let s = seed ^ (rep.wrapping_mul(0x9E37_79B9) << 20) ^ 0x1357;
         let mut lat = Lattice::new(w, h, density, (u0, 0.0), 0, rest, threads, s);
         let mut rng = Rng::new(s ^ 0xF00D);
+        let cols: Vec<Equilibrium> = (0..w)
+            .map(|x| Equilibrium::new(density, u0, amp * (k * x as f32).sin(), rest))
+            .collect();
         for y in 0..h {
             for x in 0..w {
-                let uy = amp * (k * x as f32).sin();
-                lat.cells[y * w + x] = equilibrium_sample(density, u0, uy, rest, &mut rng);
+                lat.cells[y * w + x] = cols[x].sample(&mut rng);
             }
         }
         lat

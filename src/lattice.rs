@@ -29,20 +29,86 @@ pub struct Lattice {
 /// momentum. The moving directions therefore have to be biased harder --- by
 /// the ratio of total mass to moving mass --- for the cell to actually come
 /// out at the requested velocity.
+///
+/// The probabilities depend only on the macroscopic state, never on the site,
+/// so they are computed once here and every site is then a few integer
+/// compares. Sampling is what the inlet re-seed spends its time on, and it is
+/// bound by the generator's dependency chain rather than by the arithmetic:
+/// each draw has to finish before the next can start. Hence the packing below,
+/// which takes two samples from one step of the generator instead of one.
+pub struct Equilibrium {
+    /// `ceil(p * 2^24)` per direction: a 24-bit draw `k` is a hit exactly when
+    /// `k < t`.
+    thresh: [u32; NDIR],
+    /// `None` when the model has no rest particles, so the extra draw is
+    /// skipped entirely rather than being made and discarded.
+    rest: Option<u32>,
+}
+
+/// `p` as a 24-bit threshold, so that integer `k < threshold(p)` agrees with
+/// the float `k as f32 / 2^24 < p` for every `k` a draw can produce.
+///
+/// `k / 2^24` is exact in `f32` (24-bit mantissa) and so is `p * 2^24` (it only
+/// moves the exponent), so the two comparisons are over the same reals and
+/// `ceil` is the exact integer boundary. Out-of-range `p` clamps to the same
+/// always/never behaviour the float compare had, and a NaN `p` saturates to 0,
+/// matching `k < NaN` being false.
 #[inline]
-pub fn equilibrium_sample(density: f32, ux: f32, uy: f32, rest: bool, rng: &mut Rng) -> u8 {
-    let bias = if rest { 2.0 * 7.0 / 6.0 } else { 2.0 };
-    let mut s = 0u8;
-    for d in 0..NDIR {
-        let p = density * (1.0 + bias * (CXF[d] * ux + CYF[d] * uy));
-        if rng.next_f32() < p {
-            s |= 1 << d;
+fn threshold(p: f32) -> u32 {
+    const ONE: f32 = 16_777_216.0; // 2^24
+    let t = (p * ONE).ceil();
+    if t >= ONE {
+        ONE as u32
+    } else if t > 0.0 {
+        t as u32
+    } else {
+        0
+    }
+}
+
+impl Equilibrium {
+    pub fn new(density: f32, ux: f32, uy: f32, rest: bool) -> Self {
+        let bias = if rest { 2.0 * 7.0 / 6.0 } else { 2.0 };
+        let mut thresh = [0u32; NDIR];
+        for d in 0..NDIR {
+            thresh[d] = threshold(density * (1.0 + bias * (CXF[d] * ux + CYF[d] * uy)));
+        }
+        Equilibrium {
+            thresh,
+            rest: if rest { Some(threshold(density)) } else { None },
         }
     }
-    if rest && rng.next_f32() < density {
-        s |= REST_BIT;
+
+    /// One cell state. Six directions come from three steps of the generator,
+    /// two 24-bit samples each.
+    ///
+    /// The samples are taken from bits 40..64 and 16..40. The top slice is the
+    /// same one `Rng::next_f32` uses; the second is placed above the low
+    /// sixteen bits, which are the weakest part of a multiply's output and the
+    /// reason `next_u32` returns the high half in the first place.
+    #[inline(always)]
+    pub fn sample(&self, rng: &mut Rng) -> u8 {
+        let mut s = 0u8;
+        for d in (0..NDIR).step_by(2) {
+            let r = rng.next_u64();
+            s |= ((((r >> 40) as u32) < self.thresh[d]) as u8) << d;
+            s |= (((((r >> 16) as u32) & 0xFF_FFFF) < self.thresh[d + 1]) as u8) << (d + 1);
+        }
+        if let Some(t) = self.rest {
+            if ((rng.next_u64() >> 40) as u32) < t {
+                s |= REST_BIT;
+            }
+        }
+        s
     }
-    s
+}
+
+/// Sample a single cell without keeping the distribution around. Building the
+/// table costs more than the draw does, so use `Equilibrium` directly for
+/// anything that fills more than a handful of cells.
+#[inline]
+pub fn equilibrium_sample(density: f32, ux: f32, uy: f32, rest: bool, rng: &mut Rng) -> u8 {
+    Equilibrium::new(density, ux, uy, rest).sample(rng)
 }
 
 impl Lattice {
@@ -84,13 +150,9 @@ impl Lattice {
     pub fn init_equilibrium(&mut self) {
         let mut rng = Rng::new(self.seed ^ 0xA5A5_1234);
         let (ux, uy) = self.inflow;
-        let rest = self.table.rest_particles;
+        let eq = Equilibrium::new(self.density, ux, uy, self.table.rest_particles);
         for i in 0..self.cells.len() {
-            self.cells[i] = if self.solid[i] {
-                0
-            } else {
-                equilibrium_sample(self.density, ux, uy, rest, &mut rng)
-            };
+            self.cells[i] = if self.solid[i] { 0 } else { eq.sample(&mut rng) };
         }
     }
 
@@ -162,13 +224,13 @@ impl Lattice {
             return;
         }
         let (ux, uy) = self.inflow;
-        let rest = self.table.rest_particles;
+        let eq = Equilibrium::new(self.density, ux, uy, self.table.rest_particles);
         let mut rng = Rng::new(self.seed ^ self.steps.wrapping_mul(0xD1B5_4A32_D192_ED03));
         for y in 0..self.h {
             for x in 0..self.inlet_cols.min(self.w) {
                 let i = y * self.w + x;
                 if !self.solid[i] {
-                    self.cells[i] = equilibrium_sample(self.density, ux, uy, rest, &mut rng);
+                    self.cells[i] = eq.sample(&mut rng);
                 }
             }
         }
@@ -344,6 +406,72 @@ mod tests {
         // Three steps to reach the wall site, where it is turned round, then
         // three steps back: it ends up exactly where it started.
         assert_eq!(occupied[0], start);
+    }
+
+    /// Every direction must come out at its requested rate. Directions are
+    /// sampled in pairs from one step of the generator --- even ones from bits
+    /// 40..64, odd ones from 16..40 --- so a weak slice would show up here as
+    /// a systematic split between the two.
+    #[test]
+    fn every_direction_hits_its_requested_rate() {
+        const N: usize = 1_000_000;
+        for &(density, ux, uy) in &[(0.22f32, 0.3f32, 0.0f32), (0.5, 0.0, 0.2)] {
+            for &rest in &[false, true] {
+                let bias: f32 = if rest { 2.0 * 7.0 / 6.0 } else { 2.0 };
+                let eq = Equilibrium::new(density, ux, uy, rest);
+                let mut rng = Rng::new(0xC0FFEE);
+                let mut hits = [0u64; NDIR];
+                for _ in 0..N {
+                    let s = eq.sample(&mut rng);
+                    for d in 0..NDIR {
+                        hits[d] += ((s >> d) & 1) as u64;
+                    }
+                }
+                for d in 0..NDIR {
+                    let want = (density * (1.0 + bias * (CXF[d] * ux + CYF[d] * uy))) as f64;
+                    let got = hits[d] as f64 / N as f64;
+                    let sigma = (want * (1.0 - want) / N as f64).sqrt();
+                    assert!(
+                        (got - want).abs() < 5.0 * sigma,
+                        "direction {d}, rest = {rest}, u = ({ux}, {uy}): rate {got:.6} \
+                         against a requested {want:.6}, {:.1} sigma out",
+                        (got - want).abs() / sigma
+                    );
+                }
+            }
+        }
+    }
+
+    /// Taking two samples from one step of the generator is only sound if the
+    /// two stay independent; drawing them from overlapping bits would not.
+    #[test]
+    fn paired_directions_are_uncorrelated() {
+        const N: usize = 1_000_000;
+        let eq = Equilibrium::new(0.5, 0.0, 0.0, false);
+        let mut rng = Rng::new(0xBEEF);
+        let mut joint = [[0u64; NDIR]; NDIR];
+        let mut single = [0u64; NDIR];
+        for _ in 0..N {
+            let s = eq.sample(&mut rng);
+            for a in 0..NDIR {
+                single[a] += ((s >> a) & 1) as u64;
+                for b in 0..NDIR {
+                    joint[a][b] += ((s >> a) & (s >> b) & 1) as u64;
+                }
+            }
+        }
+        for a in 0..NDIR {
+            for b in (a + 1)..NDIR {
+                let (pa, pb) = (single[a] as f64 / N as f64, single[b] as f64 / N as f64);
+                let pab = joint[a][b] as f64 / N as f64;
+                let corr =
+                    (pab - pa * pb) / ((pa * (1.0 - pa)).sqrt() * (pb * (1.0 - pb)).sqrt());
+                assert!(
+                    corr.abs() < 0.01,
+                    "directions {a} and {b} are correlated at {corr:.5}"
+                );
+            }
+        }
     }
 
     /// The equilibrium sampler must deliver the velocity it is asked for, with
