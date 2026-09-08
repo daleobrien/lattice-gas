@@ -10,22 +10,22 @@
 # threads used: 12
 #
 # name                                        ns/iter    throughput
-step/512x512/t1                                601920.4    435.5 Mcell/s
-step/512x512/tN                                191783.9    1366.9 Mcell/s
-step/512x512/t1/no-rest                        607862.9    431.3 Mcell/s
-step/512x512/tN/plate                          189438.7    1383.8 Mcell/s
-step/512x512/tN/inlet                          221255.5    1184.8 Mcell/s
-step/2048x1280/t1                            10854246.8    241.5 Mcell/s
-step/2048x1280/tN                             2046104.2    1281.2 Mcell/s
-step/2048x64/tN                                122440.3    1070.5 Mcell/s
-field/sample/2048x1280                       22634062.5    115.8 Mcell/s
-field/vorticity/2048x1280                        9004.0    -
-field/mean-velocity/2048x1280                    4802.7    -
-lattice/total-particles/2048x1280               45062.6    58173.2 Mcell/s
-lattice/mean-velocity/2048x1280              24186236.2    108.4 Mcell/s
-render/write-vorticity/png                    6419184.8    56.9 Mpx/s
-render/write-arrows/svg                       3008520.8    -
-collision/build/rest                             9135.3    -
-collision/build/no-rest                          3564.2    -
-lattice/init-equilibrium/2048x1280           16691004.6    157.1 Mcell/s
-transport/measure/64                        678857792.0    -
+step/512x512/t1                                571003.0    459.1 Mcell/s
+step/512x512/tN                                184966.0    1417.3 Mcell/s
+step/512x512/t1/no-rest                        582395.4    450.1 Mcell/s
+step/512x512/tN/plate                          188725.2    1389.0 Mcell/s
+step/512x512/tN/inlet                          224436.4    1168.0 Mcell/s
+step/2048x1280/t1                            10747945.5    243.9 Mcell/s
+step/2048x1280/tN                             1521475.4    1723.0 Mcell/s
+step/2048x64/tN                                127203.3    1030.4 Mcell/s
+field/sample/2048x1280                         192063.3    13648.8 Mcell/s
+field/vorticity/2048x1280                        9332.9    -
+field/mean-velocity/2048x1280                    4735.7    -
+lattice/total-particles/2048x1280               45383.6    57761.8 Mcell/s
+lattice/mean-velocity/2048x1280                507150.1    5169.0 Mcell/s
+render/write-vorticity/png                    6671505.7    54.8 Mpx/s
+render/write-arrows/svg                       3129904.4    -
+collision/build/rest                             9111.9    -
+collision/build/no-rest                          3525.7    -
+lattice/init-equilibrium/2048x1280           17057055.6    153.7 Mcell/s
+transport/measure/64                        677370000.0    -

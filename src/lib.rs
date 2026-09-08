@@ -10,6 +10,7 @@
 pub mod collision;
 pub mod hex;
 pub mod lattice;
+pub mod moments;
 pub mod png;
 pub mod render;
 pub mod rng;

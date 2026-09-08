@@ -71,26 +71,34 @@ what it is -- a busy machine -- rather than being folded into the result.
 The point of the suite is not the individual numbers but the budget they add
 up to. For the default run -- 2048x1280 cells, 6,000 warmup steps then 40,000
 recorded ones, a field sample every 5 steps, a frame every 500 -- the measured
-per-call costs predict about 4.7 minutes of wall time, spent like this:
+per-call costs predict about 1.4 minutes of wall time, spent like this:
 
 | Phase | Calls | Each | Total | Share |
 | --- | ---: | ---: | ---: | ---: |
-| `Field::sample` | 8,001 | 22.6 ms | 181 s | **64%** |
-| `Lattice::step` | 46,000 | 2.02 ms | 93 s | 33% |
-| `transport::measure` at startup | 1 | 5.4 s | 5.4 s | 2% |
-| Writing frames (PNG + SVG) | 80 | 9.2 ms | 0.7 s | <1% |
-| `init_equilibrium` | 1 | 29 ms | 0.03 s | <1% |
+| `Lattice::step` | 46,000 | 1.62 ms | 74 s | **91%** |
+| `transport::measure` at startup | 1 | 5.4 s | 5.4 s | 7% |
+| `Field::sample` | 8,001 | 0.19 ms | 1.5 s | 2% |
+| Writing frames (PNG + SVG) | 80 | 9.8 ms | 0.8 s | 1% |
+| `init_equilibrium` | 1 | 17 ms | 0.02 s | <1% |
 
-A 1,000-step run of the binary takes 13.9 s against the 12.4 s this predicts,
-so the model is close enough to plan against.
+The step figure is `step/2048x1280/tN` plus the inlet re-seed, which that case
+leaves out and a real run pays on every step. A 5,000-step run of the binary
+takes 8.5 s against the 8.3 s this predicts, so the model is close enough to
+plan against. (`transport::measure` runs before the binary starts its own
+clock, so it is not part of that 8.5 s.)
 
-The headline is that **coarse-graining costs twice as much as simulating**.
-`Field::sample` walks all 2.6M cells single-threaded, unpacking six direction
-bits per cell into `f32` adds, while `Lattice::step` -- which does strictly
-more work per cell -- spreads itself over all twelve cores. It runs every fifth
-step by default, so the 5:1 step advantage does not come close to paying for
-the 12:1 parallelism gap. `Lattice::mean_velocity` (23.1 ms) has the same shape
-and the same problem, though it is only called for the status line.
+This table used to read the other way round: **coarse-graining cost twice as
+much as simulating**, because `Field::sample` walked all 2.6M cells on one
+thread, unpacking six direction bits per cell into `f32` adds, while
+`Lattice::step` -- which does strictly more work per cell -- spread itself over
+all twelve cores. It now looks the cell byte up in a table of packed integer
+moments (`src/moments.rs`) and shares the block rows out over the same threads
+the update uses, which took it from 22.6 ms to 0.19 ms.
+`Lattice::mean_velocity` had the same shape and the same fix, 23.1 ms to
+0.51 ms.
+
+So **the update is now 91% of the run**, and that is where the next round of
+work belongs. `PLAN.md` says what it looks like.
 
 ## What each case is for
 
@@ -98,9 +106,9 @@ and the same problem, though it is only called for the status line.
 in the program that has to be fast.
 
 * `512x512/t1` vs `2048x1280/t1`: the same kernel in and out of cache. The
-  full-size update runs at 243 Mcell/s against 429 in cache, so 57% of the
+  full-size update runs at 244 Mcell/s against 459 in cache, so 53% of the
   in-cache rate is what the memory system leaves it.
-* `512x512/tN` vs `512x512/t1`: 3.2x from 12 threads.
+* `512x512/tN` vs `512x512/t1`: 3.1x from 12 threads.
 * `2048x1280/tN`: the number that decides how long a real run takes.
 * `2048x64/tN`: a short, wide lattice pays the per-step `thread::scope` cost
   over far fewer rows, so this is where thread-spawn overhead shows up.
@@ -109,14 +117,20 @@ in the program that has to be fast.
   bottleneck.
 * `tN/plate`: solid cells take the other arm of the inner branch.
 * `tN/inlet`: the inlet re-seed is serial, so the gap to plain `512x512/tN`
-  (190 -> 241 us) is the cost of the one part of `step` that does not scale.
+  (185 -> 224 us) is the cost of the one part of `step` that does not scale.
+  Those 39 us are for 512 rows; a full-height run pays about 95 us per step,
+  which is small against today's update and would not be against a faster one.
 
 **`field/*`, `lattice/mean-velocity`, `lattice/total-particles`** -- the
-analysis passes. `total_particles` is a plain `count_ones` over the cell array
-and manages 58.5 Gcell/s. `Field::sample` and `Lattice::mean_velocity` read the
-same array, byte for byte, 500x slower; that gap is the whole story of this
-section. (`field/vorticity` and `field/mean-velocity` work on the 102x64 block
-grid rather than the lattice, which is why they are microseconds.)
+analysis passes, all three of which now read the cell array a word at a time.
+`total_particles` popcounts eight cells per instruction and manages 57.8
+Gcell/s; `Field::sample` and `Lattice::mean_velocity` look each cell byte up in
+the packed-moment tables in `src/moments.rs` and reach 13.6 and 5.2 Gcell/s.
+They used to take the cell apart a bit at a time on a single thread, at 116 and
+114 Mcell/s, and the 500x gap between those and `total_particles` was the whole
+story of this section. Closing it is most of what took the default run from 4.7
+minutes to 1.4. (`field/vorticity` and `field/mean-velocity` work on the 102x64
+block grid rather than the lattice, which is why they are microseconds.)
 
 **`render/*`** -- the hand-rolled PNG and SVG encoders. Both are small
 absolutely, and only run once per frame.
@@ -140,30 +154,30 @@ and those are worth trusting at the 1-2% level.
 
 ## Recorded baseline
 
-Apple M3 Pro, 12 cores, macOS, rustc 1.97.1, 2026-09-08. Best of seven
+Apple M3 Pro, 12 cores, macOS, rustc 1.97.1, 2026-09-09. Best of seven
 samples; throughput counts lattice cells updated or touched per second.
 
 | Case | Time | Throughput |
 | --- | ---: | ---: |
-| `step/512x512/t1` | 610.48 us | 429.4 Mcell/s |
-| `step/512x512/tN` | 190.24 us | 1378.0 Mcell/s |
-| `step/512x512/t1/no-rest` | 614.81 us | 426.4 Mcell/s |
-| `step/512x512/tN/plate` | 189.78 us | 1381.3 Mcell/s |
-| `step/512x512/tN/inlet` | 241.05 us | 1087.5 Mcell/s |
-| `step/2048x1280/t1` | 10.805 ms | 242.6 Mcell/s |
-| `step/2048x1280/tN` | 2.022 ms | 1296.7 Mcell/s |
-| `step/2048x64/tN` | 124.01 us | 1056.9 Mcell/s |
-| `field/sample/2048x1280` | 22.572 ms | 116.1 Mcell/s |
-| `field/vorticity/2048x1280` | 8.99 us | |
-| `field/mean-velocity/2048x1280` | 4.53 us | |
-| `lattice/total-particles/2048x1280` | 44.80 us | 58515.8 Mcell/s |
-| `lattice/mean-velocity/2048x1280` | 23.063 ms | 113.7 Mcell/s |
-| `render/write-vorticity/png` | 6.244 ms | 58.5 Mpx/s |
-| `render/write-arrows/svg` | 2.969 ms | |
-| `collision/build/rest` | 9.02 us | |
-| `collision/build/no-rest` | 3.48 us | |
-| `lattice/init-equilibrium/2048x1280` | 29.100 ms | 90.1 Mcell/s |
-| `transport/measure/64` | 261.43 ms | |
+| `step/512x512/t1` | 571.00 us | 459.1 Mcell/s |
+| `step/512x512/tN` | 184.97 us | 1417.3 Mcell/s |
+| `step/512x512/t1/no-rest` | 582.40 us | 450.1 Mcell/s |
+| `step/512x512/tN/plate` | 188.73 us | 1389.0 Mcell/s |
+| `step/512x512/tN/inlet` | 224.44 us | 1168.0 Mcell/s |
+| `step/2048x1280/t1` | 10.748 ms | 243.9 Mcell/s |
+| `step/2048x1280/tN` | 1.521 ms | 1723.0 Mcell/s |
+| `step/2048x64/tN` | 127.20 us | 1030.4 Mcell/s |
+| `field/sample/2048x1280` | 192.06 us | 13648.8 Mcell/s |
+| `field/vorticity/2048x1280` | 9.33 us |  |
+| `field/mean-velocity/2048x1280` | 4.74 us |  |
+| `lattice/total-particles/2048x1280` | 45.38 us | 57761.8 Mcell/s |
+| `lattice/mean-velocity/2048x1280` | 507.15 us | 5169.0 Mcell/s |
+| `render/write-vorticity/png` | 6.672 ms | 54.8 Mpx/s |
+| `render/write-arrows/svg` | 3.130 ms |  |
+| `collision/build/rest` | 9.11 us |  |
+| `collision/build/no-rest` | 3.53 us |  |
+| `lattice/init-equilibrium/2048x1280` | 17.057 ms | 153.7 Mcell/s |
+| `transport/measure/64` | 677.370 ms |  |
 
 Numbers taken on a different machine are not comparable to these; re-record the
 baseline before using it, and say in the commit message which machine it came

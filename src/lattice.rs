@@ -2,14 +2,16 @@
 
 use crate::collision::CollisionTable;
 use crate::hex::*;
+use crate::moments;
 use crate::rng::Rng;
 
 pub struct Lattice {
     pub w: usize,
     pub h: usize,
+    /// One byte per site: six moving bits, a rest bit, and `SOLID_BIT` on top
+    /// for the sites an obstacle occupies.
     pub cells: Vec<u8>,
     scratch: Vec<u8>,
-    pub solid: Vec<bool>,
     pub table: CollisionTable,
     /// Mean occupancy of a single direction, in `0..1`.
     pub density: f32,
@@ -129,7 +131,6 @@ impl Lattice {
             h,
             cells: vec![0; w * h],
             scratch: vec![0; w * h],
-            solid: vec![false; w * h],
             table: CollisionTable::build(rest_particles),
             density,
             inflow,
@@ -145,6 +146,25 @@ impl Lattice {
         y * self.w + x
     }
 
+    /// Is this site part of an obstacle?
+    #[inline]
+    pub fn is_solid(&self, i: usize) -> bool {
+        self.cells[i] & SOLID_BIT != 0
+    }
+
+    /// Mark one site as obstacle, discarding whatever was standing on it.
+    #[inline]
+    pub fn set_solid(&mut self, i: usize) {
+        self.cells[i] = SOLID_BIT;
+    }
+
+    /// Worker threads this lattice was built to use. The analysis passes read
+    /// it so they spread themselves the same way the update does.
+    #[inline]
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
     /// Fill the whole domain with the inflow equilibrium so the run starts
     /// from uniform flow rather than from rest.
     pub fn init_equilibrium(&mut self) {
@@ -152,7 +172,11 @@ impl Lattice {
         let (ux, uy) = self.inflow;
         let eq = Equilibrium::new(self.density, ux, uy, self.table.rest_particles);
         for i in 0..self.cells.len() {
-            self.cells[i] = if self.solid[i] { 0 } else { eq.sample(&mut rng) };
+            self.cells[i] = if self.cells[i] & SOLID_BIT != 0 {
+                SOLID_BIT
+            } else {
+                eq.sample(&mut rng)
+            };
         }
     }
 
@@ -162,8 +186,7 @@ impl Lattice {
                 let (px, py) = site_position(x, y);
                 if inside(px, py) {
                     let i = self.idx(x, y);
-                    self.solid[i] = true;
-                    self.cells[i] = 0;
+                    self.set_solid(i);
                 }
             }
         }
@@ -178,7 +201,6 @@ impl Lattice {
     pub fn step(&mut self) {
         let (w, h) = (self.w, self.h);
         let old: &[u8] = &self.cells;
-        let solid: &[bool] = &self.solid;
         let table = &self.table;
         let nthreads = self.threads.min(h);
         let base_seed = self.seed ^ self.steps.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -198,7 +220,6 @@ impl Lattice {
                         stream_and_collide_row(
                             old,
                             &mut chunk[r * w..(r + 1) * w],
-                            solid,
                             table,
                             &mut rng,
                             y,
@@ -229,7 +250,7 @@ impl Lattice {
         for y in 0..self.h {
             for x in 0..self.inlet_cols.min(self.w) {
                 let i = y * self.w + x;
-                if !self.solid[i] {
+                if self.cells[i] & SOLID_BIT == 0 {
                     self.cells[i] = eq.sample(&mut rng);
                 }
             }
@@ -237,29 +258,30 @@ impl Lattice {
     }
 
     /// Momentum per particle over the whole lattice.
+    ///
+    /// This counts the particles standing on obstacle sites too, which are the
+    /// ones a wall is in the middle of turning round. That is what it has
+    /// always done; `Field::sample` takes the other view and leaves them out.
     pub fn mean_velocity(&self) -> (f32, f32) {
-        let (mut px, mut py, mut mass) = (0.0f64, 0.0f64, 0.0f64);
-        for &c in &self.cells {
-            for d in 0..NDIR {
-                if c & (1 << d) != 0 {
-                    px += CXF[d] as f64;
-                    py += CYF[d] as f64;
-                    mass += 1.0;
-                }
-            }
-            if c & REST_BIT != 0 {
-                mass += 1.0;
-            }
-        }
-        if mass == 0.0 {
-            (0.0, 0.0)
-        } else {
-            ((px / mass) as f32, (py / mass) as f32)
-        }
+        moments::sum(&moments::WITH_WALLS, &self.cells).velocity()
     }
 
+    /// Particles on the lattice, obstacle sites included. `SOLID_BIT` has to be
+    /// masked off first, so this counts eight cells per popcount rather than
+    /// paying for the mask once per byte.
     pub fn total_particles(&self) -> u64 {
-        self.cells.iter().map(|c| c.count_ones() as u64).sum()
+        const MASK: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+        let mut words = self.cells.chunks_exact(8);
+        let mut n = 0u64;
+        for w in words.by_ref() {
+            let bits = u64::from_le_bytes(w.try_into().unwrap());
+            n += (bits & MASK).count_ones() as u64;
+        }
+        n + words
+            .remainder()
+            .iter()
+            .map(|c| (c & STATE_MASK).count_ones() as u64)
+            .sum::<u64>()
     }
 
 }
@@ -275,7 +297,6 @@ impl Lattice {
 fn stream_and_collide_row(
     old: &[u8],
     out: &mut [u8],
-    solid: &[bool],
     table: &CollisionTable,
     rng: &mut Rng,
     y: usize,
@@ -295,7 +316,9 @@ fn stream_and_collide_row(
 
     let row = y * w;
     for x in 0..w {
-        let mut state = old[row + x] & REST_BIT;
+        // The one load covers both the rest bit and whether this is a wall.
+        let here = old[row + x];
+        let mut state = here & REST_BIT;
         for d in 0..NDIR {
             let sx = if x == 0 || x == w - 1 {
                 (x as i32 + sdx[d]).rem_euclid(w as i32) as usize
@@ -305,8 +328,8 @@ fn stream_and_collide_row(
             state |= old[srow[d] + sx] & (1 << d);
         }
 
-        out[x] = if solid[row + x] {
-            reverse(state)
+        out[x] = if here & SOLID_BIT != 0 {
+            SOLID_BIT | reverse(state)
         } else {
             table.apply(state, rng.next_u32())
         };
@@ -338,7 +361,7 @@ mod tests {
         let mut lat = Lattice::new(32, 32, 0.2, (0.0, 0.0), 0, rest, 1, 12345);
         let mut rng = Rng::new(7);
         for c in lat.cells.iter_mut() {
-            *c = (rng.next_u32() as u8) & if rest { 0x7F } else { MOVING_MASK };
+            *c = (rng.next_u32() as u8) & if rest { STATE_MASK } else { MOVING_MASK };
         }
         lat
     }
@@ -367,8 +390,9 @@ mod tests {
                 let steps = 8;
                 lat.advance(steps as u64);
 
-                let occupied: Vec<usize> =
-                    (0..lat.cells.len()).filter(|&i| lat.cells[i] != 0).collect();
+                let occupied: Vec<usize> = (0..lat.cells.len())
+                    .filter(|&i| lat.cells[i] & STATE_MASK != 0)
+                    .collect();
                 assert_eq!(occupied.len(), 1, "direction {d}: particle was lost");
                 assert_eq!(lat.cells[occupied[0]], 1 << d, "direction {d}: turned");
 
@@ -393,16 +417,21 @@ mod tests {
         let mut lat = Lattice::new(48, 48, 0.2, (0.0, 0.0), 0, false, 1, 1);
         let (x0, y0) = (20usize, 24usize);
         let wall = lat.idx(x0 + 3, y0);
-        lat.solid[wall] = true;
+        lat.set_solid(wall);
         let start = lat.idx(x0, y0);
         lat.cells[start] = 1; // heading east
 
         lat.advance(6);
 
-        let occupied: Vec<usize> =
-            (0..lat.cells.len()).filter(|&i| lat.cells[i] != 0).collect();
+        let occupied: Vec<usize> = (0..lat.cells.len())
+            .filter(|&i| lat.cells[i] & STATE_MASK != 0)
+            .collect();
         assert_eq!(occupied.len(), 1);
-        assert_eq!(lat.cells[occupied[0]], 1 << 3, "should now head west");
+        assert_eq!(
+            lat.cells[occupied[0]] & STATE_MASK,
+            1 << 3,
+            "should now head west"
+        );
         // Three steps to reach the wall site, where it is turned round, then
         // three steps back: it ends up exactly where it started.
         assert_eq!(occupied[0], start);

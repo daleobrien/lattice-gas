@@ -37,10 +37,9 @@ cell array in 45 us --- 58 GB/s, which is what the memory system will give a
 single core. `Field::sample` reads *the same array, byte for byte* in 22.6 ms.
 The 500x between them is implementation, not physics.
 
-## Phase 1 --- coarse-graining
+## Phase 1 --- coarse-graining --- done
 
-Half a day. No physics risk: this changes how the lattice is *read*, not how it
-evolves.
+No physics risk: this changed how the lattice is *read*, not how it evolves.
 
 `Field::sample` tests six bits and does three `f32` adds per cell, on one
 thread, while also streaming a second 2.6 MB `Vec<bool>` for the solid flag.
@@ -56,18 +55,54 @@ thread, while also streaming a second 2.6 MB `Vec<bool>` for the solid flag.
    once per block, which is also *more* accurate than summing 2,800 `f32`s.
 3. **Thread it over block rows.** There are 64 of them at the default block size.
 
-Measured on a prototype: **22.76 ms -> 0.482 ms on one thread, 0.146 ms on six.**
+The same table serves `Lattice::mean_velocity` and `row_ux` / `column_uy` in
+[`src/transport.rs`](src/transport.rs). The 16-bit fields cap the block area at
+8,191 cells; the default is 400.
 
-The same table serves `Lattice::mean_velocity` (23.3 ms) and `row_ux` /
-`column_uy` in [`src/transport.rs`](src/transport.rs).
+### What it did
 
-The 16-bit fields cap the block area at 8,191 cells; the default is 400.
+| Case | Before | After | |
+| --- | ---: | ---: | ---: |
+| `field/sample/2048x1280` | 22.6 ms | 0.192 ms | **118x** |
+| `lattice/mean-velocity/2048x1280` | 23.1 ms | 0.507 ms | **46x** |
+| `step/2048x1280/tN` | 2.02 ms | 1.521 ms | 1.33x |
+| `lattice/total-particles/2048x1280` | 44.8 us | 45.4 us | --- |
 
-**Effect on the default run: 4.7 min -> ~100 s (2.8x).**
+The update got 33% faster for free: dropping the parallel `Vec<bool>` took a
+2.6 MB stream out of its inner loop as well. `total_particles` had to start
+masking `SOLID_BIT` off, which cost 24% until it was rewritten to popcount
+eight cells per instruction, and it is now back where it started.
 
-## Phase 2 --- bitplane the update
+End to end, a 5,000-step run of the binary went from **28.3 s to 8.5 s**, and
+the default run from 4.7 minutes to about 1.4. The status line went from 370M
+to 1230M cell-updates/s.
 
-About a week. This is the change that alters how the project feels to work on.
+### That it is the same simulation
+
+`golden_output_is_unchanged` reported exactly the expected pattern, which is
+what makes the change safe to believe:
+
+* **Mass and momentum were identical in all five cases.** The simulation itself
+  is untouched; not one particle moved differently.
+* **The cell checksum moved only for the two cases with a plate.** The three
+  periodic cases are byte-identical, which is what pins `SOLID_BIT` as the only
+  difference in the array.
+* **The field checksum moved everywhere**, from exact integer accumulation
+  replacing the `f32` running sum.
+* `physics_is_unchanged`, `stepping_is_deterministic` and
+  `thread_count_does_not_change_conserved_quantities` all stayed green, the
+  last of which covers the newly threaded `Field::sample`.
+
+`Lattice::mean_velocity` still reports the same numbers to six decimals, so the
+recorded `ux` and `uy` did not move at all. Decoding the output PNGs before and
+after, the frames differ on 0.005% of channels by one part in 255 --- and the
+new arithmetic is the more accurate of the two.
+
+## Phase 2 --- bitplane the update --- next
+
+About a week. This is the change that alters how the project feels to work on,
+and with Phase 1 done the update is 91% of the run, so it is now the only thing
+worth attacking.
 
 Store 64 cells per `u64`: seven planes for the six directions and the rest
 particle, plus a solid plane. This is how the original FHP simulations ran, and
@@ -114,7 +149,7 @@ within noise. That is a quantitative check on a rewrite that changes every
 random draw in the program. Keep the byte kernel as the reference
 implementation.
 
-**Effect on the default run: ~100 s -> ~10 s (about 30x overall).**
+**Effect on the default run: ~1.4 min -> ~10 s (about 30x overall).**
 
 ## Phase 3 --- Metal, if bigger runs are wanted
 

@@ -5,8 +5,9 @@
 //! 20x20 cells, and we do the same, optionally with a running time average on
 //! top to quieten the residual fluctuation.
 
-use crate::hex::{CXF, CYF, NDIR, REST_BIT, SQRT3_2};
+use crate::hex::SQRT3_2;
 use crate::lattice::Lattice;
+use crate::moments;
 use std::path::Path;
 
 /// A block counts as obstacle for display purposes above this solid fraction.
@@ -44,40 +45,74 @@ impl Field {
 
     /// Accumulate the current lattice state. `alpha` of 1.0 is a pure spatial
     /// average of this instant; smaller values blend with the running history.
+    ///
+    /// A block is summed through `moments::FLUID`, one table load and one
+    /// integer add per cell, and the block rows are shared out over the same
+    /// worker threads the update uses. Each block's sum is exact and depends
+    /// only on its own cells, so the thread count cannot change the answer.
+    ///
+    /// Obstacle sites are left out of the mass and momentum --- a block that is
+    /// half wall reports the velocity of the half that is fluid --- but their
+    /// share of the block is recorded in `solid`.
     pub fn sample(&mut self, lat: &Lattice, alpha: f32) {
-        let n = (self.bx * self.by) as f32;
-        for by in 0..self.bh {
-            for bx in 0..self.bw {
-                let (mut px, mut py, mut mass, mut solid) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-                for y in by * self.by..(by + 1) * self.by {
-                    let row = y * lat.w;
-                    for x in bx * self.bx..(bx + 1) * self.bx {
-                        let i = row + x;
-                        if lat.solid[i] {
-                            solid += 1.0;
-                            continue;
-                        }
-                        let c = lat.cells[i];
-                        for d in 0..NDIR {
-                            if c & (1 << d) != 0 {
-                                px += CXF[d];
-                                py += CYF[d];
-                                mass += 1.0;
+        assert!(
+            self.bx * self.by <= moments::MAX_BLOCK,
+            "a {} x {} block holds {} cells, more than the {} a packed sum can \
+             accumulate without its fields carrying into one another",
+            self.bx,
+            self.by,
+            self.bx * self.by,
+            moments::MAX_BLOCK
+        );
+        let (bw, bh, bx, by) = (self.bw, self.bh, self.bx, self.by);
+        if bw == 0 || bh == 0 {
+            return;
+        }
+        let (w, cells) = (lat.w, &lat.cells[..]);
+        let n = (bx * by) as f32;
+        let band = {
+            let nthreads = lat.threads().clamp(1, bh);
+            (bh + nthreads - 1) / nthreads
+        };
+        let stripe = band * bw;
+
+        std::thread::scope(|scope| {
+            for (b, (((ux, uy), rho), solid)) in self
+                .ux
+                .chunks_mut(stripe)
+                .zip(self.uy.chunks_mut(stripe))
+                .zip(self.rho.chunks_mut(stripe))
+                .zip(self.solid.chunks_mut(stripe))
+                .enumerate()
+            {
+                scope.spawn(move || {
+                    let mut acc = vec![0u64; bw];
+                    for r in 0..ux.len() / bw {
+                        acc.iter_mut().for_each(|a| *a = 0);
+                        let jb = b * band + r;
+                        for y in jb * by..(jb + 1) * by {
+                            let row = &cells[y * w..y * w + bw * bx];
+                            for (ib, a) in acc.iter_mut().enumerate() {
+                                moments::accumulate(
+                                    &moments::FLUID,
+                                    &row[ib * bx..(ib + 1) * bx],
+                                    a,
+                                );
                             }
                         }
-                        if c & REST_BIT != 0 {
-                            mass += 1.0;
+                        for (ib, &a) in acc.iter().enumerate() {
+                            let m = moments::unpack(a, bx * by);
+                            let (vx, vy) = m.velocity();
+                            let k = r * bw + ib;
+                            ux[k] += alpha * (vx - ux[k]);
+                            uy[k] += alpha * (vy - uy[k]);
+                            rho[k] += alpha * (m.mass as f32 / n - rho[k]);
+                            solid[k] = m.solid as f32 / n;
                         }
                     }
-                }
-                let k = by * self.bw + bx;
-                let (vx, vy) = if mass > 0.0 { (px / mass, py / mass) } else { (0.0, 0.0) };
-                self.ux[k] += alpha * (vx - self.ux[k]);
-                self.uy[k] += alpha * (vy - self.uy[k]);
-                self.rho[k] += alpha * (mass / n - self.rho[k]);
-                self.solid[k] = solid / n;
+                });
             }
-        }
+        });
     }
 
     /// Vorticity on the block grid, in units of inverse lattice time.

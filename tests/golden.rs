@@ -139,11 +139,11 @@ fn run(c: &Case, seed: u64) -> Outcome {
 type Golden = (&'static str, u64, u64, i64, i64, i64, f32, f32);
 
 const GOLDEN: &[Golden] = &[
-    ("periodic/rest/t1", 0x6836a7941f22413e, 0xf9433f58fa3e5ebd, 25380, 14999, 177, 0.295489, 0.006040),
-    ("periodic/no-rest/t1", 0x60bca9c9366b2da7, 0x6b20f956bf7f1f31, 21733, 12964, -34, 0.298256, -0.001355),
-    ("periodic/rest/t3", 0x6c568bfe63b36041, 0xd4da8460c2a05b2d, 25380, 14999, 177, 0.295489, 0.006040),
-    ("channel/plate/inlet/t1", 0xe5f6797107562f76, 0xca197131ead99cdf, 11701, 6836, 52, 0.292112, 0.003849),
-    ("channel/plate/inlet/t4", 0x60f04a62971cdf4f, 0xcbc5f6838465669a, 11685, 6777, 127, 0.289987, 0.009413),
+    ("periodic/rest/t1", 0x6836a7941f22413e, 0x2ef0cd774a7e93be, 25380, 14999, 177, 0.295489, 0.006040),
+    ("periodic/no-rest/t1", 0x60bca9c9366b2da7, 0x9ebeb21fffe77bc4, 21733, 12964, -34, 0.298256, -0.001355),
+    ("periodic/rest/t3", 0x6c568bfe63b36041, 0xc0e475819e2481d6, 25380, 14999, 177, 0.295489, 0.006040),
+    ("channel/plate/inlet/t1", 0x435cc70a5ddcaef6, 0xe8270bd1fb49fb49, 11701, 6836, 52, 0.292112, 0.003849),
+    ("channel/plate/inlet/t4", 0x151d9c62d8f873cf, 0x4f0354593ef1135d, 11685, 6777, 127, 0.289987, 0.009413),
 ];
 
 fn golden(name: &str) -> Option<&'static Golden> {

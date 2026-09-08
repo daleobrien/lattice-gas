@@ -13,8 +13,9 @@
 //! realisations are averaged *before* the fit -- the signal is identical
 //! across them and adds, while the fluctuations are zero-mean and cancel.
 
-use crate::hex::{CXF, CYF, NDIR, REST_BIT, SQRT3_2};
+use crate::hex::SQRT3_2;
 use crate::lattice::{Equilibrium, Lattice};
+use crate::moments;
 use crate::rng::Rng;
 use std::f64::consts::PI;
 
@@ -41,47 +42,54 @@ impl Transport {
 }
 
 /// Column-wise mean velocity along y, weighted by the particles present.
+///
+/// Walked a row at a time rather than a column at a time: one packed
+/// accumulator per column turns what was a stride-`w` crawl through the whole
+/// lattice per column into a single sequential pass over it.
 fn column_uy(lat: &Lattice) -> Vec<f32> {
-    let mut out = vec![0.0; lat.w];
-    for x in 0..lat.w {
-        let (mut py, mut mass) = (0.0f64, 0.0f64);
-        for y in 0..lat.h {
-            let c = lat.cells[y * lat.w + x];
-            for d in 0..NDIR {
-                if c & (1 << d) != 0 {
-                    py += CYF[d] as f64;
-                    mass += 1.0;
-                }
-            }
-            if c & REST_BIT != 0 {
-                mass += 1.0;
+    let (w, h) = (lat.w, lat.h);
+    let mut mass = vec![0i64; w];
+    let mut py2 = vec![0i64; w];
+    let mut acc = vec![0u64; w];
+
+    let mut y0 = 0;
+    while y0 < h {
+        // Flush before a 16-bit field can overflow.
+        let y1 = (y0 + moments::MAX_BLOCK).min(h);
+        acc.iter_mut().for_each(|a| *a = 0);
+        for y in y0..y1 {
+            let row = &lat.cells[y * w..(y + 1) * w];
+            for (a, &c) in acc.iter_mut().zip(row) {
+                *a += moments::WITH_WALLS[c as usize];
             }
         }
-        out[x] = if mass > 0.0 { (py / mass) as f32 } else { 0.0 };
+        for x in 0..w {
+            let m = moments::unpack(acc[x], y1 - y0);
+            mass[x] += m.mass;
+            py2[x] += m.py2;
+        }
+        y0 = y1;
     }
-    out
+
+    (0..w)
+        .map(|x| {
+            if mass[x] > 0 {
+                py2[x] as f32 * SQRT3_2 / mass[x] as f32
+            } else {
+                0.0
+            }
+        })
+        .collect()
 }
 
 /// Row-wise mean velocity along x.
 fn row_ux(lat: &Lattice) -> Vec<f32> {
-    let mut out = vec![0.0; lat.h];
-    for y in 0..lat.h {
-        let (mut px, mut mass) = (0.0f64, 0.0f64);
-        for x in 0..lat.w {
-            let c = lat.cells[y * lat.w + x];
-            for d in 0..NDIR {
-                if c & (1 << d) != 0 {
-                    px += CXF[d] as f64;
-                    mass += 1.0;
-                }
-            }
-            if c & REST_BIT != 0 {
-                mass += 1.0;
-            }
-        }
-        out[y] = if mass > 0.0 { (px / mass) as f32 } else { 0.0 };
-    }
-    out
+    (0..lat.h)
+        .map(|y| {
+            let row = &lat.cells[y * lat.w..(y + 1) * lat.w];
+            moments::sum(&moments::WITH_WALLS, row).velocity().0
+        })
+        .collect()
 }
 
 fn fit_slope(pts: &[(f64, f64)]) -> f64 {
