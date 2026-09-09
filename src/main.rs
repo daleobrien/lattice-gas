@@ -305,13 +305,13 @@ impl Progress {
         }
     }
 
-    /// Blank rows to keep below the view: the blank line the summary starts
-    /// with, however many rows the summary itself wraps onto, and the row the
-    /// cursor comes to rest on after it.
+    /// Blank rows to keep below the view. The summary is written over the bar
+    /// at the end, so the bar's own row covers all of a summary that fits on
+    /// one line, and only the rows it wraps onto need holding open.
     fn reserved(&self) -> usize {
         match self.size {
-            Some((_, cols)) => 1 + self.summary.div_ceil(cols.max(1)),
-            None => 2,
+            Some((_, cols)) => self.summary.div_ceil(cols.max(1)).saturating_sub(1),
+            None => 1,
         }
     }
 
@@ -359,14 +359,45 @@ impl Progress {
         }
         self.drawn = block.bytes().filter(|b| *b == b'\n').count();
         let _ = out.write_all(block.as_bytes());
-        // Take the rows the closing summary will need now, while the view can
-        // still be redrawn, and step back over them. Printing those two lines
-        // at the end then costs no scrolling, so the last view stays where the
-        // run left it instead of sliding up out of place.
+        // Take the rows a wrapping summary will spill onto now, while the view
+        // can still be redrawn, and step back over them. Closing the display
+        // then costs no scrolling, so the last view stays where the run left it
+        // instead of sliding up out of place.
         let reserved = self.reserved();
-        let _ = write!(out, "{}\x1b[{reserved}A", "\n".repeat(reserved));
+        if reserved > 0 {
+            let _ = write!(out, "{}\x1b[{reserved}A", "\n".repeat(reserved));
+        }
         let _ = out.flush();
     }
+
+    /// Close the display by writing the summary where the bar was, leaving the
+    /// run's last view above it rather than a bar stopped at 100%.
+    fn finish(&mut self, summary: &str) {
+        let mut out = std::io::stdout().lock();
+        if self.in_place && self.drawn > 0 {
+            // Up onto the bar and clear from there down; the view stays put.
+            let _ = write!(out, "\x1b[1A\x1b[J");
+        } else {
+            // Nothing to write over, so keep the blank line that used to
+            // separate the summary from the frames above it.
+            let _ = writeln!(out);
+        }
+        let _ = writeln!(out, "{summary}");
+        let _ = out.flush();
+    }
+}
+
+/// The step counter as a bar filled to the fraction of the run that is done,
+/// drawn to the width the view above it uses.
+fn bar(step: u64, steps: u64, cols: usize) -> String {
+    // Both numbers are padded to the width they end at, so nothing beside the
+    // bar shuffles sideways as the run goes on.
+    let digits = steps.to_string().len();
+    let count = format!("{:>3}%  step {step:>digits$}/{steps}", 100 * step / steps.max(1));
+    // Whatever the brackets and the count beside them leave.
+    let width = cols.saturating_sub(count.len() + 4);
+    let filled = (width as u64 * step / steps.max(1)) as usize;
+    format!("[{}{}]  {count}\n", "#".repeat(filled), ".".repeat(width - filled))
 }
 
 /// Cut every line to the width of the window. A line that runs past the right
@@ -561,23 +592,20 @@ fn run(c: Config) {
     let summary = |secs: f64, rate: f64, frames: u64, mass1: u64| {
         format!(
             "done in {secs:.1}s at {rate:.0}M cell-updates/s. {frames} frames in {}. \
-             particle count {mass0} -> {mass1} ({}).",
+             particle count {mass0} -> {mass1}{}.",
             c.out.display(),
-            if mass0 == mass1 {
-                "exactly conserved"
-            } else {
-                "changed at the inflow boundary, as expected"
-            }
+            if mass0 == mass1 { ", exactly conserved" } else { "" }
         )
     };
 
     // Four writers cover a `--frame-every` down to about 100 steps; past that
     // the run waits on them, which is the right way round.
     let frames = Frames::new(nth.clamp(1, 4));
-    // Times and rates no run will exceed, so the measurement is an upper bound
-    // on the real one and the view never ends up a row short.
+    // Times and rates no run will exceed, and the wordier of the two endings,
+    // so the measurement is an upper bound on the real one and the view never
+    // ends up a row short.
     let mut progress = Progress::new(
-        summary(9999.9, 99999.0, c.steps.div_ceil(c.frame_every), mass0 + 1).len(),
+        summary(9999.9, 99999.0, c.steps.div_ceil(c.frame_every), mass0).len(),
     );
     let mut frame = 0usize;
     let mut step = 0u64;
@@ -606,14 +634,12 @@ fn run(c: Config) {
         }
 
         if !c.quiet {
-            // Padded to the width of the total, so the count does not shuffle
-            // sideways as it grows under a view that no longer scrolls away.
-            let digits = c.steps.to_string().len();
             let (cols, rows) = progress.view();
-            let mut block = format!("step {step:>digits$}/{}\n", c.steps);
+            let mut block = String::new();
             if c.preview {
                 block.push_str(&render::ascii_preview(&field, cols, rows));
             }
+            block.push_str(&bar(step, c.steps, cols));
             progress.draw(block);
         }
         frame += 1;
@@ -627,6 +653,6 @@ fn run(c: Config) {
     if !c.quiet {
         let secs = start.elapsed().as_secs_f64();
         let rate = (c.width * c.height) as f64 * c.steps as f64 / secs / 1e6;
-        println!("\n{}", summary(secs, rate, frame as u64, mass1));
+        progress.finish(&summary(secs, rate, frame as u64, mass1));
     }
 }
