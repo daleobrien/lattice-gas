@@ -412,17 +412,24 @@ written: measuring its collision circuit is what showed the same rule was worth
 3.4x on twelve cores and 43x on the GPU, so Phase 3 was promoted past it and
 the byte-per-cell CPU kernel kept as the reference implementation instead.
 
-**4.7 minutes to 1.7 seconds, about 165x.** Measured against the memory system
+**4.7 minutes to 1.7 seconds of simulation, 2.0 s of wall clock.** Measured against the memory system
 rather than the clock, the step is done: it moves its compulsory 4.92 MB in
 0.0330 ms, which is 152 GB/s, and a bare streaming copy on this machine manages
 140. The 685-operator collision circuit is free. Nothing further will come from
 arithmetic; only from moving less of the lattice, which means fusing two steps
 into one kernel pass through threadgroup memory.
 
-What is left in a run is 1.70 s of stepping and 0.78 s of startup, 0.67 of that
-the transport measurement --- which at 256x256 dispatches 2,048 threads and so
-spends its time waiting rather than computing. Its four realisations are
-independent and could go into one command buffer.
+What is left in a run is 1.70 s of stepping and 0.41 s of startup, 0.30 of that
+the transport measurement. That one turned out to be launch-bound rather than
+anything else: at 256x256 a step dispatches 2,048 threads and costs 6.8 us,
+against 33 us for a step forty times the size. Two easy things halved it twice
+over --- unpacking the planes a word at a time rather than a cell at a time
+(451 to 2,611 Mcell/s), and running the viscosity and advection measurements on
+two threads, since neither can fill the machine on its own and both are
+deterministic, so the numbers do not move. Making the four realisations
+concurrent as well would need replicas inside the step kernel, which is not a
+thing to do to the hottest and most carefully tested code in the program for a
+startup cost.
 
 The prize the plan named was size rather than speed, and it is still there: at
 8192x5120 the GPU sustains 0.58 ms a step, so the Re ~ 400 regime that needed

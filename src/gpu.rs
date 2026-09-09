@@ -26,6 +26,11 @@ const BITS: usize = 32;
 /// outside the ping-pong, because it never changes.
 const PLANES: usize = NDIR + 1;
 
+/// Plane `d` is bit `d` of the cell byte, all the way up: the six directions,
+/// then the rest bit, then the solid bit. `store` unpacks in that order
+/// without naming the constants, so say here that they line up.
+const _: () = assert!(REST_BIT == 1 << NDIR && SOLID_BIT == 1 << PLANES);
+
 // ---------------------------------------------------------------------------
 // Emitting the collision rule
 // ---------------------------------------------------------------------------
@@ -586,28 +591,33 @@ impl GpuLattice {
     }
 
     /// Gather the planes back into one byte per cell.
+    ///
+    /// A word at a time rather than a cell at a time: the eight planes that
+    /// describe a cell are eight words that also describe the thirty-one cells
+    /// beside it, so they are worth loading once and taking apart in
+    /// registers. Done per cell this was the most expensive thing in
+    /// `transport::measure`, which projects the lattice onto a Fourier mode
+    /// every few steps and comes through here to do it.
     pub fn store(&self, cells: &mut [u8]) {
         assert_eq!(cells.len(), self.w * self.h, "wrong number of cells");
         let (w, wpr, total) = (self.w, self.wpr, self.total);
         let planes = self.a.as_slice::<u32>();
         let solid = self.solid.as_slice::<u32>();
-        for y in 0..self.h {
-            for x in 0..w {
-                let word = y * wpr + x / BITS;
-                let bit = 1u32 << (x % BITS);
-                let mut c = 0u8;
-                for d in 0..NDIR {
-                    if planes[d * total + word] & bit != 0 {
-                        c |= 1 << d;
+        for (y, row) in cells.chunks_mut(w).enumerate() {
+            for (jw, out) in row.chunks_mut(BITS).enumerate() {
+                let word = y * wpr + jw;
+                let mut p = [0u32; PLANES + 1];
+                for (d, v) in p.iter_mut().enumerate().take(PLANES) {
+                    *v = planes[d * total + word];
+                }
+                p[PLANES] = solid[word];
+                for (k, c) in out.iter_mut().enumerate() {
+                    let mut b = 0u8;
+                    for (d, &v) in p.iter().enumerate() {
+                        b |= (((v >> k) & 1) as u8) << d;
                     }
+                    *c = b;
                 }
-                if planes[NDIR * total + word] & bit != 0 {
-                    c |= REST_BIT;
-                }
-                if solid[word] & bit != 0 {
-                    c |= SOLID_BIT;
-                }
-                cells[y * w + x] = c;
             }
         }
     }

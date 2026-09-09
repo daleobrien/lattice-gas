@@ -502,6 +502,21 @@ fn main() {
                 build(100),
                 |(g, n)| g.advance(*n),
             );
+            // The size `transport::measure` works at. 2,048 threads is far too
+            // few to fill this GPU, so the case exists to show what the step
+            // costs when it is launch latency rather than memory bandwidth.
+            r.bench(
+                "step/gpu/256x256/batched",
+                cells(256 * 256 * 100),
+                || {
+                    let mut g = GpuLattice::new(256, 256, true, SEED).expect("gpu lattice");
+                    let mut seed = Lattice::new(256, 256, DENSITY, (SPEED, 0.0), 0, true, 1, SEED);
+                    seed.init_equilibrium();
+                    g.load(&seed.cells);
+                    (g, 100u64)
+                },
+                |(g, n)| g.advance(*n),
+            );
             // The two things a real run adds to a bare step: the inflow
             // boundary, which is folded into the step kernel, and a field
             // sample every fifth step. Both are meant to disappear into the
@@ -536,6 +551,16 @@ fn main() {
                     g
                 },
                 |g| g.sample_field(0.2),
+            );
+            // Unpacking the planes back to one byte per cell. Nothing in a
+            // run needs this, but `transport::measure` projects the lattice
+            // onto a Fourier mode every few steps and went through here to
+            // do it, so its cost decided the shape of that code.
+            r.bench(
+                "lattice/gpu/store/2048x1280",
+                cells(bw * bh),
+                || (build(1)().0, vec![0u8; bw * bh]),
+                |(g, cells)| g.store(cells),
             );
             r.bench(
                 "lattice/gpu/total-particles/2048x1280",

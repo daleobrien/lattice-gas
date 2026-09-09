@@ -75,9 +75,9 @@ per-call costs predict this:
 
 | Phase | Calls | Each | Total | Share |
 | --- | ---: | ---: | ---: | ---: |
-| `GpuLattice::advance_sampling` | 46,000 | 0.037 ms | 1.70 s | **69%** |
-| `transport::measure` at startup | 1 | 0.67 s | 0.67 s | 27% |
-| `init_equilibrium` and setup | 1 | 0.11 s | 0.11 s | 4% |
+| `GpuLattice::advance_sampling` | 46,000 | 0.037 ms | 1.70 s | **81%** |
+| `transport::measure` at startup | 1 | 0.30 s | 0.30 s | 14% |
+| `init_equilibrium` and setup | 1 | 0.11 s | 0.11 s | 5% |
 | Writing frames (PNG + SVG) | 80 | 9.5 ms | 0.76 s | *overlapped* |
 
 The step figure is `step/gpu/2048x1280/batched+inlet+sample`, which is the
@@ -89,7 +89,7 @@ Frame encoding is in the table but not in the total, because it does not happen
 on the critical path: the frames go to a pool of writer threads while the GPU
 carries on stepping. The binary reports 1.7 s of simulation against the 1.70 s
 the step alone predicts, so all 0.76 s of deflate and SVG formatting is hidden.
-Wall time is 2.8 s including startup.
+Wall time is 2.0 s including startup.
 
 **The step is now at the memory wall.** It moves a compulsory 4.92 MB --- seven
 planes and the solid plane read, seven written --- and at 0.0330 ms that is 152
@@ -156,6 +156,19 @@ are cumulative, and the gaps between them are the interesting part:
   samples across the hundred steps add 0.0026 ms a step, so coarse-graining has
   gone from twice the cost of simulating to seven percent of it.
 
+**`step/gpu/256x256`** -- the size `transport::measure` works at, and the
+reason it is a separate line in the budget above. 2,048 threads is eight times
+short of filling this GPU, so a step there costs 6.8 us against 33 us for one
+forty times the size: it is paying launch latency, not moving memory. Since it
+is latency-bound, the two transport measurements simply run on two threads and
+interleave, which halves them.
+
+**`lattice/gpu/store`** -- unpacking the planes back to one byte per cell.
+Nothing in a run needs it, but the transport measurement projects the lattice
+onto a Fourier mode every few steps and comes through here. Taking a word at a
+time rather than a cell at a time -- the eight planes that describe a cell also
+describe the thirty-one beside it -- took it from 451 to 2,611 Mcell/s.
+
 **`field/gpu/sample`, `lattice/gpu/total-particles`** -- the analysis passes on
 the device, timed on their own and so paying a full round trip each: about 0.14
 and 0.17 ms against a floor of 0.09 ms for an empty submit. Inside a batch the
@@ -204,31 +217,33 @@ per-step figure.
 
 | Case | Time | Throughput |
 | --- | ---: | ---: |
-| `step/512x512/t1` | 574.06 us | 456.7 Mcell/s |
-| `step/512x512/tN` | 175.46 us | 1494.0 Mcell/s |
-| `step/512x512/t1/no-rest` | 572.07 us | 458.2 Mcell/s |
-| `step/512x512/tN/plate` | 175.10 us | 1497.1 Mcell/s |
-| `step/512x512/tN/inlet` | 202.90 us | 1292.0 Mcell/s |
-| `step/2048x1280/t1` | 10.625 ms | 246.7 Mcell/s |
-| `step/2048x1280/tN` | 1.426 ms | 1838.6 Mcell/s |
-| `step/2048x64/tN` | 106.55 us | 1230.1 Mcell/s |
-| `step/gpu/2048x1280/one-per-submit` | 157.46 us | 16648.6 Mcell/s |
-| `step/gpu/2048x1280/batched` | 3.315 ms | 79089.2 Mcell/s |
-| `step/gpu/2048x1280/batched+inlet` | 3.433 ms | 76357.9 Mcell/s |
-| `step/gpu/2048x1280/batched+inlet+sample` | 3.698 ms | 70886.7 Mcell/s |
-| `field/gpu/sample/2048x1280` | 129.08 us | 20307.9 Mcell/s |
-| `lattice/gpu/total-particles/2048x1280` | 152.11 us | 17233.8 Mcell/s |
-| `field/sample/2048x1280` | 172.73 us | 15176.4 Mcell/s |
-| `field/vorticity/2048x1280` | 8.98 us |  |
-| `field/mean-velocity/2048x1280` | 4.80 us |  |
-| `lattice/total-particles/2048x1280` | 44.56 us | 58833.4 Mcell/s |
-| `lattice/mean-velocity/2048x1280` | 501.22 us | 5230.1 Mcell/s |
-| `render/write-vorticity/png` | 6.510 ms | 56.2 Mpx/s |
-| `render/write-arrows/svg` | 2.982 ms |  |
-| `collision/build/rest` | 7.08 us |  |
-| `collision/build/no-rest` | 3.15 us |  |
-| `lattice/init-equilibrium/2048x1280` | 17.229 ms | 152.1 Mcell/s |
-| `transport/measure/64` | 632.003 ms |  |
+| `step/512x512/t1` | 569.28 us | 460.5 Mcell/s |
+| `step/512x512/tN` | 174.18 us | 1505.0 Mcell/s |
+| `step/512x512/t1/no-rest` | 567.04 us | 462.3 Mcell/s |
+| `step/512x512/tN/plate` | 174.04 us | 1506.2 Mcell/s |
+| `step/512x512/tN/inlet` | 201.11 us | 1303.5 Mcell/s |
+| `step/2048x1280/t1` | 10.562 ms | 248.2 Mcell/s |
+| `step/2048x1280/tN` | 1.411 ms | 1857.9 Mcell/s |
+| `step/2048x64/tN` | 122.13 us | 1073.2 Mcell/s |
+| `step/gpu/2048x1280/one-per-submit` | 158.49 us | 16540.6 Mcell/s |
+| `step/gpu/2048x1280/batched` | 3.303 ms | 79366.4 Mcell/s |
+| `step/gpu/256x256/batched` | 681.26 us | 9619.8 Mcell/s |
+| `step/gpu/2048x1280/batched+inlet` | 3.433 ms | 76353.7 Mcell/s |
+| `step/gpu/2048x1280/batched+inlet+sample` | 3.702 ms | 70815.7 Mcell/s |
+| `field/gpu/sample/2048x1280` | 128.72 us | 20366.2 Mcell/s |
+| `lattice/gpu/store/2048x1280` | 1.004 ms | 2610.9 Mcell/s |
+| `lattice/gpu/total-particles/2048x1280` | 151.97 us | 17250.2 Mcell/s |
+| `field/sample/2048x1280` | 173.83 us | 15080.6 Mcell/s |
+| `field/vorticity/2048x1280` | 8.93 us |  |
+| `field/mean-velocity/2048x1280` | 4.51 us |  |
+| `lattice/total-particles/2048x1280` | 44.57 us | 58811.2 Mcell/s |
+| `lattice/mean-velocity/2048x1280` | 501.12 us | 5231.2 Mcell/s |
+| `render/write-vorticity/png` | 6.505 ms | 56.2 Mpx/s |
+| `render/write-arrows/svg` | 2.984 ms |  |
+| `collision/build/rest` | 7.06 us |  |
+| `collision/build/no-rest` | 3.14 us |  |
+| `lattice/init-equilibrium/2048x1280` | 17.237 ms | 152.1 Mcell/s |
+| `transport/measure/64` | 630.525 ms |  |
 
 Numbers taken on a different machine are not comparable to these; re-record the
 baseline before using it, and say in the commit message which machine it came

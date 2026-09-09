@@ -296,6 +296,22 @@ pub fn measure(
     size: usize,
     gpu: bool,
 ) -> Transport {
+    // The two measurements are independent, and on the GPU each one is a
+    // 256x256 lattice --- 2,048 threads, which leaves the machine eight times
+    // short of busy and makes every step a launch latency rather than a
+    // memory transfer. Two of them from two threads interleave almost
+    // perfectly. Each builds its own device and queue inside its own thread,
+    // so nothing Metal owns crosses the boundary.
+    //
+    // Not done on the CPU path, where the two would fight over the same cores
+    // and each measurement's thread count is part of its random stream.
+    if gpu {
+        return std::thread::scope(|scope| {
+            let nu = scope.spawn(|| viscosity(density, rest, threads, seed, size, true));
+            let g = advection_factor(density, rest, threads, seed, size, true);
+            Transport { nu: nu.join().expect("viscosity measurement panicked"), g }
+        });
+    }
     Transport {
         nu: viscosity(density, rest, threads, seed, size, gpu),
         g: advection_factor(density, rest, threads, seed, size, gpu),
