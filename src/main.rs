@@ -7,6 +7,9 @@ use lattice_gas::render::{self, Field};
 use lattice_gas::sim::Sim;
 use lattice_gas::transport;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Instant;
 
 #[derive(Clone)]
@@ -182,6 +185,93 @@ fn parse_args() -> Result<(Config, Mode), String> {
     Ok((c, mode))
 }
 
+/// One frame's worth of output, on its way to a writer thread.
+struct Frame {
+    field: Field,
+    png: PathBuf,
+    svg: PathBuf,
+    scale: usize,
+    arrow_scale: f32,
+    mean: (f32, f32),
+}
+
+/// Frames are written on threads of their own.
+///
+/// Encoding one costs about 10 ms --- 6.7 of PNG deflate, 3.1 of SVG
+/// formatting --- against 19 ms of stepping between frames, so doing it inline
+/// left the GPU idle for a third of the run. The frames are independent and a
+/// copy of the field is 100 kB, so they can simply be handed off. The queue is
+/// bounded, so a run that outpaces its writers waits for them rather than
+/// growing without limit.
+struct Frames {
+    tx: Option<mpsc::SyncSender<Frame>>,
+    workers: Vec<thread::JoinHandle<()>>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+fn write_frame(f: &Frame) -> std::io::Result<()> {
+    let vort = f.field.vorticity();
+    let wmax = {
+        let mut v: Vec<f32> = vort
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| f.field.solid[*k] < 0.12)
+            .map(|(_, x)| x.abs())
+            .collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.get(v.len() * 98 / 100).copied().unwrap_or(1e-3).max(1e-5)
+    };
+    render::write_vorticity(&f.png, &f.field, f.scale, wmax)?;
+    render::write_arrows(&f.svg, &f.field, f.arrow_scale, f.mean)
+}
+
+impl Frames {
+    fn new(workers: usize) -> Frames {
+        let (tx, rx) = mpsc::sync_channel::<Frame>(workers);
+        let rx = Arc::new(Mutex::new(rx));
+        let failure = Arc::new(Mutex::new(None));
+        let workers = (0..workers)
+            .map(|_| {
+                let (rx, failure) = (Arc::clone(&rx), Arc::clone(&failure));
+                thread::spawn(move || loop {
+                    // The lock is held only across `recv`, so the workers take
+                    // turns picking a frame up and then run in parallel.
+                    let job = rx.lock().unwrap().recv();
+                    let Ok(job) = job else { return };
+                    if let Err(e) = write_frame(&job) {
+                        let mut slot = failure.lock().unwrap();
+                        slot.get_or_insert_with(|| format!("{}: {e}", job.png.display()));
+                    }
+                })
+            })
+            .collect();
+        Frames { tx: Some(tx), workers, failure }
+    }
+
+    /// Queue a frame, and report the first write that failed. Errors surface a
+    /// frame or two late, which is soon enough to stop a run whose output
+    /// directory has filled up.
+    fn write(&self, frame: Frame) -> Result<(), String> {
+        let _ = self.tx.as_ref().expect("writers still running").send(frame);
+        match &*self.failure.lock().unwrap() {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Wait for everything queued to reach the disk.
+    fn finish(mut self) -> Result<(), String> {
+        drop(self.tx.take());
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+        match &*self.failure.lock().unwrap() {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
 fn threads(c: &Config) -> usize {
     if c.threads > 0 {
         c.threads
@@ -318,6 +408,9 @@ fn run(c: Config) {
     }
     sim.sample(&mut field, 1.0);
 
+    // Four writers cover a `--frame-every` down to about 100 steps; past that
+    // the run waits on them, which is the right way round.
+    let frames = Frames::new(nth.clamp(1, 4));
     let mut frame = 0usize;
     let mut step = 0u64;
     while step < c.steps {
@@ -330,22 +423,19 @@ fn run(c: Config) {
         step += chunk;
 
         let mean = field.mean_velocity();
-        let vort = field.vorticity();
-        let wmax = {
-            let mut v: Vec<f32> = vort
-                .iter()
-                .enumerate()
-                .filter(|(k, _)| field.solid[*k] < 0.12)
-                .map(|(_, x)| x.abs())
-                .collect();
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            v.get(v.len() * 98 / 100).copied().unwrap_or(1e-3).max(1e-5)
-        };
-
         let png = c.out.join(format!("vorticity-{frame:04}.png"));
-        render::write_vorticity(&png, &field, c.scale, wmax).expect("png write failed");
         let svg = c.out.join(format!("arrows-{frame:04}.svg"));
-        render::write_arrows(&svg, &field, c.arrow_scale, mean).expect("svg write failed");
+        if let Err(e) = frames.write(Frame {
+            field: field.clone(),
+            png: png.clone(),
+            svg,
+            scale: c.scale,
+            arrow_scale: c.arrow_scale,
+            mean,
+        }) {
+            eprintln!("error: writing a frame failed: {e}");
+            std::process::exit(1);
+        }
 
         if !c.quiet {
             let rate = (c.width * c.height) as f64 * step as f64
@@ -369,6 +459,10 @@ fn run(c: Config) {
     }
 
     let mass1 = sim.total_particles();
+    if let Err(e) = frames.finish() {
+        eprintln!("error: writing a frame failed: {e}");
+        std::process::exit(1);
+    }
     if !c.quiet {
         println!(
             "\ndone in {:.1}s. {frame} frames in {}. particle count {} -> {} ({}).",

@@ -29,13 +29,14 @@ cargo build --release
 
 The defaults are chosen to reproduce the book's picture on a laptop: 2048 x
 1280 cells, a plate 173 cells across, Reynolds number near 100. That is 2.6
-million cells in about 8 MB, and about three seconds on an M3 Pro.
+million cells in about 8 MB, and under two seconds on an M3 Pro.
 
 On macOS the update runs on the GPU by default, as bitplanes -- one bit per
 cell per direction, 32 cells to a word, so a collision is Boolean algebra
 evaluated on 32 cells at once. `--no-gpu` runs the byte-per-cell CPU kernel
-instead, which is the reference implementation and about thirty times slower.
-The header line says which one is running.
+instead, which is the reference implementation and about forty times slower.
+The header line says which one is running. Frames are encoded on their own
+threads, so writing them does not hold the simulation up.
 
 Each frame is written twice: `vorticity-NNNN.png`, a colour map of the
 vorticity (blue and red for the two senses of rotation), and

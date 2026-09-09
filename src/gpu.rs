@@ -192,7 +192,9 @@ inline uint bernoulli(uint t, thread uint& r) {
     return x;
 }
 
-// P: 0 wpr, 1 h, 2 seed, 3 lastword, 4 lastbit, 5 tailmask, 6 total
+// P: 0 wpr, 1 h, 2 seed, 3 lastword, 4 lastbit, 5 tailmask, 6 total,
+//    7 inlet words per row, 8 inlet columns, 9 inlet threads (h * 7),
+//    10 words per row outside the inlet, 11..17 the seven thresholds
 kernel void lgca_step(device const uint* a     [[buffer(0)]],
                       device uint* b           [[buffer(1)]],
                       device const uint* solid [[buffer(2)]],
@@ -200,7 +202,24 @@ kernel void lgca_step(device const uint* a     [[buffer(0)]],
                       uint gid [[thread_position_in_grid]]) {
     uint wpr = P[0], hh = P[1], total = P[6];
     if (gid >= total) return;
-    uint y = gid / wpr, j = gid - y * wpr;
+
+    // Thread index to lattice word, with the words the inflow boundary touches
+    // brought to the front. The inlet is a couple of words at the start of each
+    // row, so under the obvious row-major mapping they are `wpr` apart and half
+    // of all 32-wide SIMD groups contain one -- which means half the machine
+    // runs the re-seed while thirty-one lanes in thirty-two wait for it.
+    // Gathered at the front they occupy 1.5% of the groups instead of 50%.
+    // Threads still walk a row in order, so nothing about coalescing changes;
+    // with no inlet `iw` is zero and this is exactly `gid / wpr`.
+    // Written as one division with selected operands rather than two branches
+    // with one each: integer division by a runtime value is not cheap, and
+    // this kernel has no spare cycles to hide a second one behind.
+    uint iw = P[7], nthr = P[9];
+    bool in_inlet = gid < nthr;
+    uint per = in_inlet ? iw : P[10];        // words per row in this range
+    uint g = in_inlet ? gid : gid - nthr;
+    uint y = g / per;
+    uint j = (in_inlet ? 0u : iw) + (g - y * per);
     uint lastword = P[3], lastbit = P[4];
 
     const int DXE[6] = {1, 0, -1, -1, -1, 0};
@@ -251,46 +270,23 @@ kernel void lgca_step(device const uint* a     [[buffer(0)]],
     for (uint d = 0; d < 6; ++d) res[d] = (sm & n[(d + 3u) % 6u]) | (fluid & o[d]);
     res[6] = (sm & n[6]) | (fluid & o[6]);
 
+    // The inflow boundary: the leftmost columns are redrawn from equilibrium
+    // every step, which is what maintains the mean flow. A wall is not
+    // re-seeded, so `fluid` masks it out.
+    if (j < iw) {
+        uint span = min(P[8] - j * 32u, 32u);
+        uint imask = (span >= 32u) ? 0xffffffffu : ((1u << span) - 1u);
+        uint apply = imask & fluid;
+        if (apply != 0u) {
+            uint r = mix(gid ^ P[2] ^ 0x9e3779b9u);
+            for (uint d = 0; d < 7u; ++d) {
+                res[d] = (res[d] & ~apply) | (bernoulli(P[11u + d], r) & apply);
+            }
+        }
+    }
+
     uint mask = (j == lastword) ? P[5] : 0xffffffffu;
     for (uint d = 0; d < 7; ++d) b[d * total + y * wpr + j] = res[d] & mask;
-}
-
-// The inflow boundary: the leftmost columns are redrawn from equilibrium every
-// step, which is what maintains the mean flow.
-//
-// Its own dispatch, one thread per word that actually needs re-seeding, which
-// is the cheaper of two bad options and was measured rather than guessed.
-//
-// Folded into the step it cost 0.019 ms a step, more than half the step
-// itself, and cost exactly the same for an inlet of 1 column as for 512: the
-// inlet is one word in sixty-four, so one lane of each 32-wide group did the
-// work while the other thirty-one waited. As its own dispatch it costs 0.014
-// ms, and again the same for 1 column as for 512 -- that is not the work
-// either, it is what a second dispatch costs, since the GPU must drain the
-// step before this can start. Both numbers are overhead; this one is smaller.
-
-//
-// S: 0 wpr, 1 h, 2 seed, 3 inlet columns, 4 inlet words, 5 total,
-//    6..12 the seven equilibrium thresholds
-kernel void lgca_inlet(device uint* a           [[buffer(0)]],
-                       device const uint* solid [[buffer(1)]],
-                       constant uint* S         [[buffer(2)]],
-                       uint gid [[thread_position_in_grid]]) {
-    uint iw = S[4];
-    if (gid >= S[1] * iw) return;
-    uint y = gid / iw, j = gid - y * iw;
-    uint word = y * S[0] + j, total = S[5];
-
-    uint span = min(S[3] - j * 32u, 32u);
-    uint imask = (span >= 32u) ? 0xffffffffu : ((1u << span) - 1u);
-    uint apply = imask & ~solid[word];        // a wall is not re-seeded
-    if (apply == 0u) return;
-
-    uint r = mix(word ^ S[2] ^ 0x9e3779b9u);
-    for (uint d = 0; d < 7u; ++d) {
-        uint k = d * total + word;
-        a[k] = (a[k] & ~apply) | (bernoulli(S[6u + d], r) & apply);
-    }
 }
 
 // Coarse-graining, one thread per block of the display grid.
@@ -437,7 +433,6 @@ fn sample_params(g: &GpuField, wpr: usize, total: usize, alpha: f32) -> [u32; 8]
 pub struct GpuLattice {
     dev: Device,
     step: Pipeline,
-    inlet: Pipeline,
     sample: Pipeline,
     count: Pipeline,
     a: Buffer,
@@ -465,7 +460,6 @@ impl GpuLattice {
         let source = format!("#include <metal_stdlib>\nusing namespace metal;\n{}{}",
                              collide_source(rest_particles), KERNELS);
         let step = dev.pipeline(&source, "lgca_step")?;
-        let inlet = dev.pipeline(&source, "lgca_inlet")?;
         let sample = dev.pipeline(&source, "lgca_sample")?;
         let count = dev.pipeline(&source, "lgca_count")?;
         let wpr = w.div_ceil(BITS);
@@ -477,7 +471,6 @@ impl GpuLattice {
         Ok(GpuLattice {
             dev,
             step,
-            inlet,
             sample,
             count,
             a,
@@ -526,36 +519,26 @@ impl GpuLattice {
         });
     }
 
-    fn params(&self) -> [u32; 7] {
+    fn params(&self) -> [u32; 11 + PLANES] {
         let lastword = ((self.w - 1) / BITS) as u32;
         let lastbit = ((self.w - 1) % BITS) as u32;
         let tail = if lastbit == 31 { u32::MAX } else { (1u32 << (lastbit + 1)) - 1 };
-        [
-            self.wpr as u32,
-            self.h as u32,
-            (self.seed ^ self.steps.wrapping_mul(0x9E37_79B9_7F4A_7C15)) as u32,
-            lastword,
-            lastbit,
-            tail,
-            self.total as u32,
-        ]
-    }
-
-    /// Words per row that the inflow boundary touches, and so the width of its
-    /// dispatch. Zero when there is no inlet.
-    fn inlet_words(&self) -> usize {
-        self.inlet_cols.div_ceil(BITS)
-    }
-
-    fn inlet_params(&self) -> [u32; 6 + PLANES] {
-        let mut p = [0u32; 6 + PLANES];
+        let iw = self.inlet_cols.div_ceil(BITS);
+        let mut p = [0u32; 11 + PLANES];
         p[0] = self.wpr as u32;
         p[1] = self.h as u32;
-        p[2] = (self.seed ^ self.steps.wrapping_mul(0xD1B5_4A32_D192_ED03)) as u32;
-        p[3] = self.inlet_cols as u32;
-        p[4] = self.inlet_words() as u32;
-        p[5] = self.total as u32;
-        p[6..].copy_from_slice(&self.thresh);
+        p[2] = (self.seed ^ self.steps.wrapping_mul(0x9E37_79B9_7F4A_7C15)) as u32;
+        p[3] = lastword;
+        p[4] = lastbit;
+        p[5] = tail;
+        p[6] = self.total as u32;
+        p[7] = iw as u32;
+        p[8] = self.inlet_cols as u32;
+        p[9] = (iw * self.h) as u32;
+        // Never zero: an inlet spanning the whole width leaves this range
+        // empty, but the divisor is still evaluated.
+        p[10] = (self.wpr - iw).max(1) as u32;
+        p[11..].copy_from_slice(&self.thresh);
         p
     }
 
@@ -657,13 +640,6 @@ impl GpuLattice {
             self.steps += 1;
             left -= 1;
             since += 1;
-
-            // After the step, as the CPU applies it.
-            let iw = self.inlet_words();
-            if iw > 0 {
-                let q = self.inlet_params();
-                batch.dispatch(&self.inlet, &[&self.a, &self.solid], &q, (iw * self.h) as u64);
-            }
 
             if sample_every > 0 && (since >= sample_every || left == 0) {
                 since = 0;

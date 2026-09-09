@@ -301,32 +301,60 @@ still ran on the CPU. Four things closed that gap.
 and the header line says which one is running. The CPU path is untouched ---
 `tests/golden.rs` still pins it bit for bit --- so it remains the reference.
 
-**A default run is 3.1 s**, against 1.4 minutes after Phase 1 and 4.7 minutes
-before it.
+**A default run is 1.7 s**, against 1.4 minutes after Phase 1 and 4.7 minutes
+before it. Two further rounds got it there from 3.1 s; both are below.
 
-### The inlet, which cost more than it should
+### The inlet, which took three tries
 
 The plan budgeted the inflow re-seed at 44% of a GPU step if it stayed on the
-CPU. It went to the GPU, and still costs 29% of one. Both ways of arranging it
-were measured, and both cost overhead rather than work:
+CPU. Moved to the GPU it was still 29% of one, and the reason took some finding
+because every measurement said the same odd thing: **the cost did not depend on
+how wide the inlet was.** One column cost what 512 did.
 
-| Inflow arrangement | ms/step | cost |
+| Inflow arrangement | ms/step | the inlet's share |
 | --- | ---: | ---: |
-| No inlet at all | 0.0324 | --- |
-| Folded into the step kernel | 0.0577 | +0.0253 |
-| Its own dispatch | 0.0457 | +0.0133 |
+| No inlet at all | 0.0323 | --- |
+| Folded into the step kernel | 0.0535 | 0.0212 |
+| Folded in, with the draws in counter mode | 0.0577 | 0.0254 |
+| Its own dispatch | 0.0452 | 0.0133 |
+| **Folded in, with the thread index remapped** | **0.0344** | **0.0014** |
 
-The tell is that neither number moves with the size of the inlet: folded in, 1
-column costs the same as 512, because the inlet is one word in sixty-four, so
-one lane of each 32-wide SIMD group does the work while the other thirty-one
-wait --- and half of all groups contain an inlet lane. As its own dispatch, 1
-column again costs the same as 512, because what is being paid for is the
-second dispatch: the GPU drains the step before the small kernel can start.
+Flat in the width of the inlet means the cost is not the work. Folded in, the
+inlet is one word in sixty-four, so under a row-major thread index its words
+sit `wpr` apart and *half of all 32-wide SIMD groups contain one* --- half the
+machine ran the re-seed while thirty-one lanes in thirty-two waited. As its own
+dispatch the flatness has a different cause: the GPU has to drain the step
+before a 1,280-thread kernel can start, and that drain is the whole cost.
+
+The fix is neither: keep it in the step kernel and **hand out the thread
+indices so the inlet's words come first**, so they occupy 1.5% of the SIMD
+groups instead of 50%. Threads still walk a row in order, so coalescing is
+unchanged, and with no inlet the mapping collapses to exactly `gid / wpr` ---
+that path stays bit-identical, which is why the acceptance tests report the
+same numbers to four figures either side of the change.
+
+It is not quite free: the extra select-and-compare costs 2.4% on a lattice with
+no inlet at all. That buys 24% on every lattice that has one, and the binary
+always has one.
 
 Breaking the random-draw dependency chain (counter mode rather than a chain of
-`mix`) made the folded version *worse*, 0.0577 rather than 0.0535, because the
-step kernel is already short of registers. The separate dispatch is the
-cheaper of two overheads, not a fix.
+`mix`) made things *worse*, which is the other lesson here --- the step kernel
+is short of registers, and counter mode wants more of them.
+
+### Frames, which were holding up the GPU
+
+Encoding a frame costs about 9.5 ms, 6.5 of PNG deflate and 3.0 of SVG
+formatting. Between frames the GPU does 500 steps, which is now 19 ms. So a
+fifth of the run was the GPU sitting idle while one CPU thread ran deflate.
+
+Frames are independent and a copy of the field is 100 kB, so they are simply
+handed to a small pool of writer threads over a bounded channel --- bounded, so
+a run that outpaces its writers waits for them instead of growing without
+limit. Four writers cover a `--frame-every` down to about 100 steps.
+
+That takes 0.8 s off the run and puts nothing back: the recorded time is now
+1.70 s against the 1.70 s the step cost alone predicts, so the encoding is
+entirely hidden.
 
 ### Notes from building it
 
@@ -360,8 +388,8 @@ dependency list empty.
 
 **Effect on the default run: ~10 s -> ~3 s (about 90--120x overall)**, at which
 point PNG and SVG encoding and process startup dominate. Measured afterwards:
-3.1 s, and the prediction about where the remaining time goes was right --- 1.9 s
-of stepping, 0.8 s of PNG and SVG, 0.7 s of startup measurement.
+3.1 s, and the prediction about what would dominate was right --- so those were
+dealt with too, and it is 1.7 s.
 
 ## Not a lever
 
@@ -384,9 +412,17 @@ written: measuring its collision circuit is what showed the same rule was worth
 3.4x on twelve cores and 43x on the GPU, so Phase 3 was promoted past it and
 the byte-per-cell CPU kernel kept as the reference implementation instead.
 
-**4.7 minutes to 3.1 seconds, about 90x.** What is left is 1.9 s of stepping,
-0.8 s of PNG and SVG encoding and 0.7 s of startup measurement, which is a
-different program's problem.
+**4.7 minutes to 1.7 seconds, about 165x.** Measured against the memory system
+rather than the clock, the step is done: it moves its compulsory 4.92 MB in
+0.0330 ms, which is 152 GB/s, and a bare streaming copy on this machine manages
+140. The 685-operator collision circuit is free. Nothing further will come from
+arithmetic; only from moving less of the lattice, which means fusing two steps
+into one kernel pass through threadgroup memory.
+
+What is left in a run is 1.70 s of stepping and 0.78 s of startup, 0.67 of that
+the transport measurement --- which at 256x256 dispatches 2,048 threads and so
+spends its time waiting rather than computing. Its four realisations are
+independent and could go into one command buffer.
 
 The prize the plan named was size rather than speed, and it is still there: at
 8192x5120 the GPU sustains 0.58 ms a step, so the Re ~ 400 regime that needed

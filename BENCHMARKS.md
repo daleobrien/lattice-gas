@@ -75,17 +75,28 @@ per-call costs predict this:
 
 | Phase | Calls | Each | Total | Share |
 | --- | ---: | ---: | ---: | ---: |
-| `GpuLattice::advance_sampling` | 46,000 | 0.048 ms | 2.2 s | **59%** |
-| Writing frames (PNG + SVG) | 80 | 9.7 ms | 0.8 s | 21% |
-| `transport::measure` at startup | 1 | 0.7 s | 0.7 s | 19% |
-| `init_equilibrium` | 1 | 18 ms | 0.02 s | <1% |
+| `GpuLattice::advance_sampling` | 46,000 | 0.037 ms | 1.70 s | **69%** |
+| `transport::measure` at startup | 1 | 0.67 s | 0.67 s | 27% |
+| `init_equilibrium` and setup | 1 | 0.11 s | 0.11 s | 4% |
+| Writing frames (PNG + SVG) | 80 | 9.5 ms | 0.76 s | *overlapped* |
 
 The step figure is `step/gpu/2048x1280/batched+inlet+sample`, which is the
 production configuration: the inflow boundary and a field sample every fifth
 step, both on the GPU, batched so the program synchronises once a frame rather
-than once a sample. The binary takes 3.1 s against the 3.7 s this predicts,
-because a real run puts 500 steps in a command buffer where the benchmark case
-puts 100, so it pays the submission a fifth as often.
+than once a sample.
+
+Frame encoding is in the table but not in the total, because it does not happen
+on the critical path: the frames go to a pool of writer threads while the GPU
+carries on stepping. The binary reports 1.7 s of simulation against the 1.70 s
+the step alone predicts, so all 0.76 s of deflate and SVG formatting is hidden.
+Wall time is 2.8 s including startup.
+
+**The step is now at the memory wall.** It moves a compulsory 4.92 MB --- seven
+planes and the solid plane read, seven written --- and at 0.0330 ms that is 152
+GB/s, against 140 GB/s for a bare streaming copy measured on the same machine.
+The 685-operator collision circuit costs nothing. Only moving less of the
+lattice will help now, which means fusing two steps into one pass through
+threadgroup memory.
 
 On `--no-gpu` the same table reads 74 s for `Lattice::step`, 1.5 s for
 `Field::sample` and 6.1 s for the startup measurement, and the run takes 1.4
@@ -129,18 +140,21 @@ in the program that has to be fast.
 **`step/gpu/*`** -- the same update on the GPU, as bitplanes. The four cases
 are cumulative, and the gaps between them are the interesting part:
 
-* `one-per-submit` vs `batched`: 0.171 ms against 0.032, the same hundred steps
-  submitted one command buffer each and all in one. A round trip costs more
-  than five steps do, which is the constraint the whole GPU path is built
-  around -- it is why coarse-graining had to become a kernel too.
-* `batched+inlet`: 0.046 ms. The inflow boundary is its own dispatch, and costs
-  0.013 ms a step almost regardless of how wide it is, because what is being
-  paid for is the second dispatch rather than the work. `PLAN.md` has the
-  measurements behind that choice; folding it into the step kernel instead cost
-  0.025 ms.
-* `batched+inlet+sample`: 0.048 ms, the production configuration. Twenty field
-  samples across the hundred steps add 0.0025 ms a step, so coarse-graining has
-  gone from twice the cost of simulating to five percent of it.
+* `one-per-submit` vs `batched`: 0.158 ms against 0.033, the same hundred steps
+  submitted one command buffer each and all in one. A round trip costs about
+  four steps, which is the constraint the whole GPU path is built around -- it
+  is why coarse-graining had to become a kernel too. Note that `batched` runs
+  with no inlet, and pays 2.4% for the remapped thread index it does not use;
+  the case below is the one to compare a real run against.
+* `batched+inlet`: 0.034 ms. The inflow boundary lives inside the step kernel,
+  and the thread index is handed out so that its words come first --- which
+  costs 0.0014 ms a step, where the two obvious arrangements cost 0.013 and
+  0.021. `PLAN.md` has the three measurements and why they differ; the short
+  version is that both of the obvious ones charge for overhead rather than
+  work, and neither varies with the width of the inlet.
+* `batched+inlet+sample`: 0.037 ms, the production configuration. Twenty field
+  samples across the hundred steps add 0.0026 ms a step, so coarse-graining has
+  gone from twice the cost of simulating to seven percent of it.
 
 **`field/gpu/sample`, `lattice/gpu/total-particles`** -- the analysis passes on
 the device, timed on their own and so paying a full round trip each: about 0.14
@@ -190,31 +204,31 @@ per-step figure.
 
 | Case | Time | Throughput |
 | --- | ---: | ---: |
-| `step/512x512/t1` | 580.49 us | 451.6 Mcell/s |
-| `step/512x512/tN` | 177.85 us | 1473.9 Mcell/s |
-| `step/512x512/t1/no-rest` | 580.09 us | 451.9 Mcell/s |
-| `step/512x512/tN/plate` | 178.00 us | 1472.7 Mcell/s |
-| `step/512x512/tN/inlet` | 210.08 us | 1247.8 Mcell/s |
-| `step/2048x1280/t1` | 10.751 ms | 243.8 Mcell/s |
-| `step/2048x1280/tN` | 1.475 ms | 1776.7 Mcell/s |
-| `step/2048x64/tN` | 127.01 us | 1032.0 Mcell/s |
-| `step/gpu/2048x1280/one-per-submit` | 168.25 us | 15580.5 Mcell/s |
-| `step/gpu/2048x1280/batched` | 3.228 ms | 81213.5 Mcell/s |
-| `step/gpu/2048x1280/batched+inlet` | 4.520 ms | 58000.4 Mcell/s |
-| `step/gpu/2048x1280/batched+inlet+sample` | 4.765 ms | 55009.3 Mcell/s |
-| `field/gpu/sample/2048x1280` | 139.64 us | 18772.8 Mcell/s |
-| `lattice/gpu/total-particles/2048x1280` | 165.16 us | 15871.8 Mcell/s |
-| `field/sample/2048x1280` | 175.28 us | 14955.5 Mcell/s |
-| `field/vorticity/2048x1280` | 9.16 us |  |
-| `field/mean-velocity/2048x1280` | 4.85 us |  |
-| `lattice/total-particles/2048x1280` | 45.08 us | 58148.6 Mcell/s |
-| `lattice/mean-velocity/2048x1280` | 512.67 us | 5113.3 Mcell/s |
-| `render/write-vorticity/png` | 6.661 ms | 54.9 Mpx/s |
-| `render/write-arrows/svg` | 3.053 ms |  |
-| `collision/build/rest` | 7.17 us |  |
-| `collision/build/no-rest` | 3.19 us |  |
-| `lattice/init-equilibrium/2048x1280` | 17.562 ms | 149.3 Mcell/s |
-| `transport/measure/64` | 661.232 ms |  |
+| `step/512x512/t1` | 574.06 us | 456.7 Mcell/s |
+| `step/512x512/tN` | 175.46 us | 1494.0 Mcell/s |
+| `step/512x512/t1/no-rest` | 572.07 us | 458.2 Mcell/s |
+| `step/512x512/tN/plate` | 175.10 us | 1497.1 Mcell/s |
+| `step/512x512/tN/inlet` | 202.90 us | 1292.0 Mcell/s |
+| `step/2048x1280/t1` | 10.625 ms | 246.7 Mcell/s |
+| `step/2048x1280/tN` | 1.426 ms | 1838.6 Mcell/s |
+| `step/2048x64/tN` | 106.55 us | 1230.1 Mcell/s |
+| `step/gpu/2048x1280/one-per-submit` | 157.46 us | 16648.6 Mcell/s |
+| `step/gpu/2048x1280/batched` | 3.315 ms | 79089.2 Mcell/s |
+| `step/gpu/2048x1280/batched+inlet` | 3.433 ms | 76357.9 Mcell/s |
+| `step/gpu/2048x1280/batched+inlet+sample` | 3.698 ms | 70886.7 Mcell/s |
+| `field/gpu/sample/2048x1280` | 129.08 us | 20307.9 Mcell/s |
+| `lattice/gpu/total-particles/2048x1280` | 152.11 us | 17233.8 Mcell/s |
+| `field/sample/2048x1280` | 172.73 us | 15176.4 Mcell/s |
+| `field/vorticity/2048x1280` | 8.98 us |  |
+| `field/mean-velocity/2048x1280` | 4.80 us |  |
+| `lattice/total-particles/2048x1280` | 44.56 us | 58833.4 Mcell/s |
+| `lattice/mean-velocity/2048x1280` | 501.22 us | 5230.1 Mcell/s |
+| `render/write-vorticity/png` | 6.510 ms | 56.2 Mpx/s |
+| `render/write-arrows/svg` | 2.982 ms |  |
+| `collision/build/rest` | 7.08 us |  |
+| `collision/build/no-rest` | 3.15 us |  |
+| `lattice/init-equilibrium/2048x1280` | 17.229 ms | 152.1 Mcell/s |
+| `transport/measure/64` | 632.003 ms |  |
 
 Numbers taken on a different machine are not comparable to these; re-record the
 baseline before using it, and say in the commit message which machine it came

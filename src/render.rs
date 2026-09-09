@@ -15,6 +15,9 @@ use std::path::Path;
 /// has to sit below that.
 const SOLID: f32 = 0.12;
 
+/// Cloneable so a frame can be handed to a writer thread and the simulation
+/// can carry on into the next one. At the default block size this is 100 kB.
+#[derive(Clone)]
 pub struct Field {
     pub bw: usize,
     pub bh: usize,
