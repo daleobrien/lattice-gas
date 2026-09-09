@@ -29,7 +29,7 @@ struct Config {
     out: PathBuf,
     frame_every: u64,
     sample_every: u64,
-    alpha: f32,
+    alpha: Option<f32>,
     scale: usize,
     arrow_scale: f32,
     rest_particles: bool,
@@ -64,7 +64,7 @@ impl Default for Config {
             out: PathBuf::from("out"),
             frame_every: 500,
             sample_every: 5,
-            alpha: 0.2,
+            alpha: None,
             scale: 8,
             arrow_scale: 1.6,
             rest_particles: true,
@@ -97,7 +97,7 @@ cells in about 8 MB, a few minutes of wall time.
   --out DIR            output directory             (default out)
   --frame-every N      steps between frames         (default 500)
   --sample-every N     steps between field samples  (default 5)
-  --alpha F            time-average weight, 0..1    (default 0.2)
+  --alpha F            time-average weight, 0..1    (default: sample-every/25)
   --scale N            pixels per block             (default 8)
   --arrow-scale F      arrow length multiplier      (default 1.6)
   --rest               use rest particles, FHP-III   (default on)\n  --no-rest            six directions only, as in the book
@@ -148,7 +148,7 @@ fn parse_args() -> Result<(Config, Mode), String> {
             "--out" => c.out = PathBuf::from(val()?),
             "--frame-every" => c.frame_every = val()?.parse().map_err(|e| format!("{e}"))?,
             "--sample-every" => c.sample_every = val()?.parse().map_err(|e| format!("{e}"))?,
-            "--alpha" => c.alpha = val()?.parse().map_err(|e| format!("{e}"))?,
+            "--alpha" => c.alpha = Some(val()?.parse().map_err(|e| format!("{e}"))?),
             "--scale" => c.scale = val()?.parse().map_err(|e| format!("{e}"))?,
             "--arrow-scale" => c.arrow_scale = val()?.parse().map_err(|e| format!("{e}"))?,
             "--threads" => c.threads = val()?.parse().map_err(|e| format!("{e}"))?,
@@ -399,6 +399,25 @@ fn terminal_size() -> Option<(usize, usize)> {
     (rows > 0 && cols > 0).then_some((rows, cols))
 }
 
+/// How many steps the running time average looks back over.
+///
+/// `--alpha` is a weight *per sample*, so raising `--sample-every` without
+/// touching it lengthens the average in steps and smears the vortices as they
+/// advect. Deriving one from the other holds the window fixed at the 25 steps
+/// the defaults have always used, which is what makes a longer sampling
+/// interval a real saving rather than a trade against the picture.
+///
+/// What it does trade against is noise: the average holds roughly
+/// `(1 / alpha) * bx * by` cells, so a longer interval needs a bigger block to
+/// stay as quiet. The defaults are 5 steps and a 20-cell block, or 2,000
+/// cells; at a 32-cell block, `--sample-every 12` matches that.
+const AVERAGE_STEPS: f32 = 25.0;
+
+fn alpha(c: &Config) -> f32 {
+    c.alpha
+        .unwrap_or_else(|| (c.sample_every as f32 / AVERAGE_STEPS).clamp(0.02, 1.0))
+}
+
 fn threads(c: &Config) -> usize {
     if c.threads > 0 {
         c.threads
@@ -527,6 +546,7 @@ fn run(c: Config) {
         );
     }
 
+    let alpha = alpha(&c);
     let start = Instant::now();
     let mass0 = sim.total_particles();
 
@@ -567,7 +587,7 @@ fn run(c: Config) {
         // CPU side would cost more than the steps themselves.
         let to_frame = c.frame_every - step % c.frame_every;
         let chunk = to_frame.min(c.steps - step);
-        sim.advance_sampling(chunk, c.sample_every, c.alpha, &mut field);
+        sim.advance_sampling(chunk, c.sample_every, alpha, &mut field);
         step += chunk;
 
         let mean = field.mean_velocity();

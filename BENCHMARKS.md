@@ -110,6 +110,21 @@ Only the largest lattices are memory-bound. At 8192x5120 the buffers are 73 MB,
 the step takes 0.587 ms, and that is 134 GB/s: the streaming rate, to within
 the error on it.
 
+Two things follow from that split, and both were measured rather than assumed.
+The obstacle plane is one of the fifteen words a step moves per lattice word,
+and at any size the obstacle is a few hundred words out of a million --- so the
+step keeps a bitmap with one bit per word saying whether there is any obstacle
+in it, and skips the load otherwise. Thirty-two threads share one load of the
+bitmap and it stays in cache. That is worth about 4%, at both 2048x1280 and
+8192x5120. It was *predicted* to be worth 7%, and is not, because the obstacle
+plane never changes and so was largely cache-resident rather than being the
+compulsory traffic the estimate assumed.
+
+The other is coarse-graining, which costs 10% of a step at 8192x5120 against
+7% at the production size --- again because at the larger size its reads add to
+a memory-bound kernel instead of hiding behind a compute-bound one. Sampling
+less often is the obvious answer and is not free; see `--sample-every` below.
+
 So at the sizes a run actually uses, the step is **compute-bound**, and the
 685-operator collision circuit is the cost. Its *shape* is not, though ---
 emitting each state's minterm standalone instead of sharing a prefix tree
@@ -215,6 +230,14 @@ in for the size-256 measurement the binary actually does; the real one is
 
 ## Reading the results
 
+**The GPU cases drift with the machine's power state**, by more than the 5%
+threshold, and for a long time after sustained load. After three back-to-back
+25-second full-lattice runs every GPU case read 4-7% above its recorded
+baseline, including cases whose code had not changed. So for anything on the
+GPU, do not trust a comparison against the baseline file: measure the two
+versions *interleaved*, in one sitting, and compare those. Doing exactly that
+turned an apparent 22% regression into a real 4% improvement.
+
 `step/gpu/2048x1280/one-per-submit` is the noisiest case in the suite and the
 one to distrust: it submits a single small dispatch and waits, so it is almost
 all submission latency, and it lands bimodally at either about 158 or about 191
@@ -242,34 +265,34 @@ per-step figure.
 
 | Case | Time | Throughput |
 | --- | ---: | ---: |
-| `step/512x512/t1` | 571.55 us | 458.7 Mcell/s |
-| `step/512x512/tN` | 174.12 us | 1505.6 Mcell/s |
-| `step/512x512/t1/no-rest` | 565.83 us | 463.3 Mcell/s |
-| `step/512x512/tN/plate` | 174.43 us | 1502.8 Mcell/s |
-| `step/512x512/tN/inlet` | 203.07 us | 1290.9 Mcell/s |
-| `step/2048x1280/t1` | 10.552 ms | 248.4 Mcell/s |
-| `step/2048x1280/tN` | 1.422 ms | 1844.0 Mcell/s |
-| `step/2048x64/tN` | 123.46 us | 1061.7 Mcell/s |
-| `step/gpu/2048x1280/one-per-submit` | 157.04 us | 16692.3 Mcell/s |
-| `step/gpu/2048x1280/batched` | 3.308 ms | 79234.4 Mcell/s |
-| `step/gpu/256x256/batched` | 695.05 us | 9428.9 Mcell/s |
-| `step/gpu/4096x2048/batched` | 8.976 ms | 93454.4 Mcell/s |
-| `step/gpu/2048x1280/batched+inlet` | 3.432 ms | 76372.2 Mcell/s |
-| `step/gpu/2048x1280/batched+inlet+sample` | 3.702 ms | 70812.7 Mcell/s |
-| `field/gpu/sample/2048x1280` | 128.09 us | 20465.0 Mcell/s |
-| `lattice/gpu/store/2048x1280` | 1.004 ms | 2611.4 Mcell/s |
-| `lattice/gpu/total-particles/2048x1280` | 148.55 us | 17646.6 Mcell/s |
-| `field/sample/2048x1280` | 170.81 us | 15346.7 Mcell/s |
-| `field/vorticity/2048x1280` | 8.91 us |  |
+| `step/512x512/t1` | 568.72 us | 460.9 Mcell/s |
+| `step/512x512/tN` | 186.36 us | 1406.6 Mcell/s |
+| `step/512x512/t1/no-rest` | 566.53 us | 462.7 Mcell/s |
+| `step/512x512/tN/plate` | 182.35 us | 1437.6 Mcell/s |
+| `step/512x512/tN/inlet` | 219.48 us | 1194.4 Mcell/s |
+| `step/2048x1280/t1` | 10.601 ms | 247.3 Mcell/s |
+| `step/2048x1280/tN` | 1.490 ms | 1759.3 Mcell/s |
+| `step/2048x64/tN` | 117.10 us | 1119.4 Mcell/s |
+| `step/gpu/2048x1280/one-per-submit` | 183.83 us | 14260.5 Mcell/s |
+| `step/gpu/2048x1280/batched` | 3.434 ms | 76339.7 Mcell/s |
+| `step/gpu/256x256/batched` | 834.60 us | 7852.4 Mcell/s |
+| `step/gpu/4096x2048/batched` | 11.109 ms | 75511.8 Mcell/s |
+| `step/gpu/2048x1280/batched+inlet` | 3.591 ms | 73009.7 Mcell/s |
+| `step/gpu/2048x1280/batched+inlet+sample` | 3.770 ms | 69532.0 Mcell/s |
+| `field/gpu/sample/2048x1280` | 150.69 us | 17396.3 Mcell/s |
+| `lattice/gpu/store/2048x1280` | 998.14 us | 2626.3 Mcell/s |
+| `lattice/gpu/total-particles/2048x1280` | 165.75 us | 15815.9 Mcell/s |
+| `field/sample/2048x1280` | 171.35 us | 15298.4 Mcell/s |
+| `field/vorticity/2048x1280` | 8.90 us |  |
 | `field/mean-velocity/2048x1280` | 4.75 us |  |
-| `lattice/total-particles/2048x1280` | 44.57 us | 58815.6 Mcell/s |
-| `lattice/mean-velocity/2048x1280` | 501.25 us | 5229.8 Mcell/s |
-| `render/write-vorticity/png` | 6.489 ms | 56.3 Mpx/s |
-| `render/write-arrows/svg` | 2.979 ms |  |
-| `collision/build/rest` | 7.04 us |  |
-| `collision/build/no-rest` | 3.14 us |  |
-| `lattice/init-equilibrium/2048x1280` | 17.225 ms | 152.2 Mcell/s |
-| `transport/measure/64` | 626.022 ms |  |
+| `lattice/total-particles/2048x1280` | 44.31 us | 59166.1 Mcell/s |
+| `lattice/mean-velocity/2048x1280` | 498.25 us | 5261.3 Mcell/s |
+| `render/write-vorticity/png` | 6.490 ms | 56.3 Mpx/s |
+| `render/write-arrows/svg` | 2.988 ms |  |
+| `collision/build/rest` | 7.10 us |  |
+| `collision/build/no-rest` | 3.16 us |  |
+| `lattice/init-equilibrium/2048x1280` | 17.119 ms | 153.1 Mcell/s |
+| `transport/measure/64` | 679.250 ms |  |
 
 Numbers taken on a different machine are not comparable to these; re-record the
 baseline before using it, and say in the commit message which machine it came

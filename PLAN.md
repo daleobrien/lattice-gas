@@ -391,6 +391,35 @@ point PNG and SVG encoding and process startup dominate. Measured afterwards:
 3.1 s, and the prediction about what would dominate was right --- so those were
 dealt with too, and it is 1.7 s.
 
+### For bigger lattices
+
+At 8192x5120 the constraint flips: 73 MB of buffers cannot be cached, the step
+runs at 134 GB/s, and it is memory bound. Two things follow, both measured on
+that lattice with a plate in it.
+
+* **The obstacle plane need not be read.** It is one of the fifteen words a
+  step moves per lattice word, and the obstacle is a few hundred words out of a
+  million. A bitmap with one bit per word, shared by thirty-two threads and
+  cache-resident, lets the rest skip the load: **about 4%**, at 2048x1280 as
+  well as 8192x5120. Predicted at 7%, and short of it because the obstacle
+  plane never changes and so was largely cached rather than being compulsory
+  traffic.
+* **Coarse-graining costs 10% of a step there**, against 7% at the production
+  size, because its reads add to a memory-bound kernel rather than hiding
+  behind a compute-bound one. Sampling less often saves 5.5% at
+  `--sample-every 12` and 9.6% at 20 --- but only honestly, because `--alpha` is
+  a weight per *sample*: raising the interval without it lengthens the average
+  in steps and smears the vortices instead of saving anything. So `--alpha` now
+  derives from `--sample-every` to hold the window at 25 steps. What is left is
+  a real trade against noise, and a bigger `--block` pays for it.
+
+What that leaves is fusing two steps into one pass through threadgroup memory,
+which halves compulsory traffic. It is the wrong idea at 2048x1280, where the
+kernel is compute-bound and it would cost threads and threadgroup memory to buy
+something that is not the constraint. At 8192x5120 it is the right idea, worth
+maybe 1.3x once the collision's own ceiling is allowed for --- the step is
+already at about 63% of this GPU's integer throughput there.
+
 ## Not a lever
 
 Measured, and recorded here so the question does not have to be asked again.

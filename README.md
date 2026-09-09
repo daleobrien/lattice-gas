@@ -48,6 +48,14 @@ with the mean flow subtracted so the fluid is at rest and the obstacle moves.
 *The same instant as an arrow plot. With the mean flow subtracted the plate is
 the thing that is moving, which is how the book presents it.*
 
+`--alpha` defaults to `--sample-every / 25`, which holds the running time
+average over a fixed 25 steps however often the field is sampled. That matters
+on a big lattice, where sampling is 10% of a step: raising `--sample-every`
+without it would quietly lengthen the average and smear the vortices as they
+advect, rather than saving anything. What a longer interval does cost is noise,
+since the average then holds fewer samples --- roughly `(1/alpha) * block^2`
+cells --- so it wants a bigger `--block` to pay for itself.
+
 `--help` lists every option. To turn the frames into a movie, if you have
 ffmpeg:
 

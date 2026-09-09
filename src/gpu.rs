@@ -200,10 +200,11 @@ inline uint bernoulli(uint t, thread uint& r) {
 // P: 0 wpr, 1 h, 2 seed, 3 lastword, 4 lastbit, 5 tailmask, 6 total,
 //    7 inlet words per row, 8 inlet columns, 9 inlet threads (h * 7),
 //    10 words per row outside the inlet, 11..17 the seven thresholds
-kernel void lgca_step(device const uint* a     [[buffer(0)]],
-                      device uint* b           [[buffer(1)]],
-                      device const uint* solid [[buffer(2)]],
-                      constant uint* P         [[buffer(3)]],
+kernel void lgca_step(device const uint* a       [[buffer(0)]],
+                      device uint* b             [[buffer(1)]],
+                      device const uint* solid   [[buffer(2)]],
+                      device const uint* anysolid[[buffer(3)]],
+                      constant uint* P           [[buffer(4)]],
                       uint gid [[thread_position_in_grid]]) {
     uint wpr = P[0], hh = P[1], total = P[6];
     if (gid >= total) return;
@@ -274,7 +275,16 @@ kernel void lgca_step(device const uint* a     [[buffer(0)]],
     collide(n, s2, s3, s5, o);
 
     // A wall sends every particle back the way it came, and never collides.
-    uint sm = solid[y * wpr + j];
+    //
+    // The obstacle is a few hundred words out of a million, but the solid
+    // plane is one of the fifteen words a step moves per lattice word --- so
+    // reading it unconditionally spends 7% of a memory-bound step on a value
+    // that is almost always zero. `anysolid` holds one bit per word, so
+    // thirty-two threads share one load of it, and it stays in cache.
+    uint sm = 0u;
+    if ((anysolid[word >> 5] >> (word & 31u)) & 1u) {
+        sm = solid[word];
+    }
     uint fluid = ~sm;
     uint res[7];
     for (uint d = 0; d < 6; ++d) res[d] = (sm & n[(d + 3u) % 6u]) | (fluid & o[d]);
@@ -448,6 +458,9 @@ pub struct GpuLattice {
     a: Buffer,
     b: Buffer,
     solid: Buffer,
+    /// One bit per lattice word: is there any obstacle in it? Lets the step
+    /// skip the solid load for the overwhelming majority of words.
+    anysolid: Buffer,
     /// One `uint` for `lgca_count` to accumulate into.
     counter: Buffer,
     field: Option<GpuField>,
@@ -477,6 +490,7 @@ impl GpuLattice {
         let a = dev.buffer(total * PLANES * 4);
         let b = dev.buffer(total * PLANES * 4);
         let solid = dev.buffer(total * 4);
+        let anysolid = dev.buffer(total.div_ceil(32) * 4);
         let counter = dev.buffer(4);
         Ok(GpuLattice {
             dev,
@@ -486,6 +500,7 @@ impl GpuLattice {
             a,
             b,
             solid,
+            anysolid,
             counter,
             field: None,
             w,
@@ -563,6 +578,9 @@ impl GpuLattice {
         for v in self.solid.as_mut_slice::<u32>().iter_mut() {
             *v = 0;
         }
+        for v in self.anysolid.as_mut_slice::<u32>().iter_mut() {
+            *v = 0;
+        }
         let planes = self.a.as_mut_slice::<u32>();
         let solid = self.solid.as_mut_slice::<u32>();
         for y in 0..self.h {
@@ -581,6 +599,12 @@ impl GpuLattice {
                 if c & SOLID_BIT != 0 {
                     solid[word] |= bit;
                 }
+            }
+        }
+        let (solid, any) = (self.solid.as_slice::<u32>(), self.anysolid.as_mut_slice::<u32>());
+        for (i, &s) in solid.iter().enumerate() {
+            if s != 0 {
+                any[i >> 5] |= 1u32 << (i & 31);
             }
         }
     }
@@ -650,7 +674,12 @@ impl GpuLattice {
         let (mut left, mut since) = (n, 0u64);
         while left > 0 {
             let p = self.params();
-            batch.dispatch(&self.step, &[&self.a, &self.b, &self.solid], &p, total as u64);
+            batch.dispatch(
+                &self.step,
+                &[&self.a, &self.b, &self.solid, &self.anysolid],
+                &p,
+                total as u64,
+            );
             std::mem::swap(&mut self.a, &mut self.b);
             self.steps += 1;
             left -= 1;
