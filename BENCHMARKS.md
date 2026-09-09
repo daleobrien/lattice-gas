@@ -230,13 +230,30 @@ in for the size-256 measurement the binary actually does; the real one is
 
 ## Reading the results
 
-**The GPU cases drift with the machine's power state**, by more than the 5%
-threshold, and for a long time after sustained load. After three back-to-back
-25-second full-lattice runs every GPU case read 4-7% above its recorded
-baseline, including cases whose code had not changed. So for anything on the
-GPU, do not trust a comparison against the baseline file: measure the two
-versions *interleaved*, in one sitting, and compare those. Doing exactly that
-turned an apparent 22% regression into a real 4% improvement.
+**The GPU cases carry a per-dispatch host cost that moves with the machine**,
+by far more than the 5% threshold, and the smaller the case the worse it is.
+On a busy afternoon the four step cases read like this against a baseline
+recorded on a quiet one, none of their code having changed:
+
+| Case | Work per dispatch | Against baseline |
+| --- | ---: | ---: |
+| `one-per-submit` | 33 us plus a full sync | +30.7% |
+| `256x256/batched` | 6.8 us | +28.3% |
+| `2048x1280/batched` | 33 us | +7.8% |
+| `4096x2048/batched` | 90 us | +0.5% |
+
+That is one number, not four: about 2 us of extra cost per dispatch, which is
+30% of a 6.8 us dispatch and 2% of a 90 us one. It is a host-side cost --- the
+CPU issuing the work --- and it tracks load average rather than anything the
+GPU is doing, so waiting for the machine to cool does not fix it and the
+largest case never sees it at all.
+
+The consequence: **for anything on the GPU, do not trust a comparison against
+the baseline file.** Measure the two versions *interleaved*, in one sitting,
+and compare those. Doing exactly that turned an apparent 22% regression into
+the real 4% improvement it was. And only re-record the GPU entries when the
+smallest cases are back near their recorded values, which is the signal that
+the machine is quiet enough for the numbers to mean anything.
 
 `step/gpu/2048x1280/one-per-submit` is the noisiest case in the suite and the
 one to distrust: it submits a single small dispatch and waits, so it is almost
