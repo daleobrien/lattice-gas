@@ -517,6 +517,24 @@ fn main() {
                 },
                 |(g, n)| g.advance(*n),
             );
+            // A lattice big enough to fill the machine. Throughput rises
+            // with size all the way to here -- 61 Gcell/s at 1024x1024, 79 at
+            // the production size, 93 here -- which is the signature of a
+            // kernel that wants more threads to hide latency behind, not of
+            // one starved of memory bandwidth.
+            r.bench(
+                "step/gpu/4096x2048/batched",
+                cells(4096 * 2048 * 100),
+                || {
+                    let mut g = GpuLattice::new(4096, 2048, true, SEED).expect("gpu lattice");
+                    let mut seed =
+                        Lattice::new(4096, 2048, DENSITY, (SPEED, 0.0), 0, true, 1, SEED);
+                    seed.init_equilibrium();
+                    g.load(&seed.cells);
+                    (g, 100u64)
+                },
+                |(g, n)| g.advance(*n),
+            );
             // The two things a real run adds to a bare step: the inflow
             // boundary, which is folded into the step kernel, and a field
             // sample every fifth step. Both are meant to disappear into the

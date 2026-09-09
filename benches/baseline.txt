@@ -10,30 +10,31 @@
 # threads used: 12
 #
 # name                                        ns/iter    throughput
-step/512x512/t1                                569278.9    460.5 Mcell/s
-step/512x512/tN                                174183.4    1505.0 Mcell/s
-step/512x512/t1/no-rest                        567043.9    462.3 Mcell/s
-step/512x512/tN/plate                          174040.8    1506.2 Mcell/s
-step/512x512/tN/inlet                          201110.4    1303.5 Mcell/s
-step/2048x1280/t1                            10561726.2    248.2 Mcell/s
-step/2048x1280/tN                             1410953.7    1857.9 Mcell/s
-step/2048x64/tN                                122133.9    1073.2 Mcell/s
-step/gpu/2048x1280/one-per-submit              158485.5    16540.6 Mcell/s
-step/gpu/2048x1280/batched                    3302960.2    79366.4 Mcell/s
-step/gpu/256x256/batched                       681263.2    9619.8 Mcell/s
-step/gpu/2048x1280/batched+inlet              3433283.0    76353.7 Mcell/s
-step/gpu/2048x1280/batched+inlet+sample       3701775.6    70815.7 Mcell/s
-field/gpu/sample/2048x1280                     128715.2    20366.2 Mcell/s
-lattice/gpu/store/2048x1280                   1004023.2    2610.9 Mcell/s
-lattice/gpu/total-particles/2048x1280          151965.7    17250.2 Mcell/s
-field/sample/2048x1280                         173828.2    15080.6 Mcell/s
-field/vorticity/2048x1280                        8928.7    -
-field/mean-velocity/2048x1280                    4513.8    -
-lattice/total-particles/2048x1280               44573.8    58811.2 Mcell/s
-lattice/mean-velocity/2048x1280                501120.5    5231.2 Mcell/s
-render/write-vorticity/png                    6504712.0    56.2 Mpx/s
-render/write-arrows/svg                       2984486.7    -
-collision/build/rest                             7057.9    -
-collision/build/no-rest                          3138.0    -
-lattice/init-equilibrium/2048x1280           17237055.6    152.1 Mcell/s
-transport/measure/64                        630524875.0    -
+step/512x512/t1                                571548.9    458.7 Mcell/s
+step/512x512/tN                                174118.4    1505.6 Mcell/s
+step/512x512/t1/no-rest                        565826.7    463.3 Mcell/s
+step/512x512/tN/plate                          174433.5    1502.8 Mcell/s
+step/512x512/tN/inlet                          203072.4    1290.9 Mcell/s
+step/2048x1280/t1                            10551863.1    248.4 Mcell/s
+step/2048x1280/tN                             1421618.9    1844.0 Mcell/s
+step/2048x64/tN                                123459.8    1061.7 Mcell/s
+step/gpu/2048x1280/one-per-submit              157044.8    16692.3 Mcell/s
+step/gpu/2048x1280/batched                    3308460.2    79234.4 Mcell/s
+step/gpu/256x256/batched                       695051.9    9428.9 Mcell/s
+step/gpu/4096x2048/batched                    8976155.6    93454.4 Mcell/s
+step/gpu/2048x1280/batched+inlet              3432454.4    76372.2 Mcell/s
+step/gpu/2048x1280/batched+inlet+sample       3701934.8    70812.7 Mcell/s
+field/gpu/sample/2048x1280                     128094.1    20465.0 Mcell/s
+lattice/gpu/store/2048x1280                   1003856.8    2611.4 Mcell/s
+lattice/gpu/total-particles/2048x1280          148551.8    17646.6 Mcell/s
+field/sample/2048x1280                         170814.2    15346.7 Mcell/s
+field/vorticity/2048x1280                        8909.5    -
+field/mean-velocity/2048x1280                    4751.6    -
+lattice/total-particles/2048x1280               44570.5    58815.6 Mcell/s
+lattice/mean-velocity/2048x1280                501249.2    5229.8 Mcell/s
+render/write-vorticity/png                    6489016.3    56.3 Mpx/s
+render/write-arrows/svg                       2978591.7    -
+collision/build/rest                             7041.3    -
+collision/build/no-rest                          3140.9    -
+lattice/init-equilibrium/2048x1280           17224694.4    152.2 Mcell/s
+transport/measure/64                        626022417.0    -

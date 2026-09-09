@@ -412,12 +412,36 @@ written: measuring its collision circuit is what showed the same rule was worth
 3.4x on twelve cores and 43x on the GPU, so Phase 3 was promoted past it and
 the byte-per-cell CPU kernel kept as the reference implementation instead.
 
-**4.7 minutes to 1.7 seconds of simulation, 2.0 s of wall clock.** Measured against the memory system
-rather than the clock, the step is done: it moves its compulsory 4.92 MB in
-0.0330 ms, which is 152 GB/s, and a bare streaming copy on this machine manages
-140. The 685-operator collision circuit is free. Nothing further will come from
-arithmetic; only from moving less of the lattice, which means fusing two steps
-into one kernel pass through threadgroup memory.
+**4.7 minutes to 1.7 seconds of simulation, 2.0 s of wall clock.**
+
+An earlier draft of this paragraph said the step had reached the memory wall:
+it moves a compulsory 4.92 MB in 0.0330 ms, which is 152 GB/s, and a streaming
+copy on this machine manages 140. That reasoning is wrong, and the way it is
+wrong is worth keeping. 4.6 MB of buffers never leaves cache, so the step never
+has to sustain that rate against memory at all; the comparison was against a
+number that does not apply.
+
+Two measurements say what actually limits it. Replacing the collision with the
+identity makes the same kernel **2.2 to 2.5 times faster** at every size that
+fits in cache. And throughput *rises* with the lattice --- 61 Gcell/s at
+1024x1024, 79 at the production size, 81 at 2048x2048, 93 at 4096x2048 ---
+which is a kernel short of threads to hide latency behind, not one short of
+bandwidth. Only 8192x5120, whose 73 MB of buffers cannot be cached, is memory
+bound: 0.587 ms a step is 134 GB/s, the streaming rate.
+
+So **the step is compute-bound at every size a run uses**, and that kills the
+idea this paragraph used to end with. Fusing two steps into one pass through
+threadgroup memory halves memory traffic, which is not the constraint; it pays
+for that with a halo of extra collisions, fewer threads and 10 kB of
+threadgroup memory per group, all three of which push on the constraint that
+is. It would be worth trying only at 8192x5120 and above.
+
+The circuit's *shape* is not the cost either: emitting each state's minterm
+standalone rather than sharing a prefix tree measures the same to half a
+percent, because the Metal compiler finds the sharing on its own --- the same
+negative result LLVM gave on the CPU. What is left is the rule itself, 685
+operators plus about 130 for the draws, and making that cheaper means changing
+the physics rather than the code.
 
 What is left in a run is 1.70 s of stepping and 0.41 s of startup, 0.30 of that
 the transport measurement. That one turned out to be launch-bound rather than

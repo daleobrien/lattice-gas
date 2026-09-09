@@ -263,8 +263,13 @@ kernel void lgca_step(device const uint* a     [[buffer(0)]],
     }
     n[6] = a[6u * total + y * wpr + j];               // rest particles do not move
 
+    // Keyed on the lattice word, not on the thread index. Those were the same
+    // thing until the inlet remapping above, and keeping them apart is what
+    // lets a kernel that visits the words in a different order --- one fusing
+    // two steps, say --- be checked against this one bit for bit.
+    uint word = y * wpr + j;
     uint s2; uint s3[3]; uint s5[5];
-    draws(gid ^ P[2], s2, s3, s5);
+    draws(word ^ P[2], s2, s3, s5);
     uint o[7];
     collide(n, s2, s3, s5, o);
 
@@ -283,7 +288,7 @@ kernel void lgca_step(device const uint* a     [[buffer(0)]],
         uint imask = (span >= 32u) ? 0xffffffffu : ((1u << span) - 1u);
         uint apply = imask & fluid;
         if (apply != 0u) {
-            uint r = mix(gid ^ P[2] ^ 0x9e3779b9u);
+            uint r = mix(word ^ P[2] ^ 0x9e3779b9u);
             for (uint d = 0; d < 7u; ++d) {
                 res[d] = (res[d] & ~apply) | (bernoulli(P[11u + d], r) & apply);
             }

@@ -91,12 +91,30 @@ carries on stepping. The binary reports 1.7 s of simulation against the 1.70 s
 the step alone predicts, so all 0.76 s of deflate and SVG formatting is hidden.
 Wall time is 2.0 s including startup.
 
-**The step is now at the memory wall.** It moves a compulsory 4.92 MB --- seven
-planes and the solid plane read, seven written --- and at 0.0330 ms that is 152
-GB/s, against 140 GB/s for a bare streaming copy measured on the same machine.
-The 685-operator collision circuit costs nothing. Only moving less of the
-lattice will help now, which means fusing two steps into one pass through
-threadgroup memory.
+**What limits the step depends on how big the lattice is**, and the answer at
+the production size is not what a bandwidth calculation suggests. It moves a
+compulsory 4.92 MB a step --- seven planes and the solid plane read, seven
+written --- which at 0.0330 ms works out at 152 GB/s, against 140 GB/s for a
+bare streaming copy measured on this machine. That looks like the memory wall
+and is not: 4.6 MB of buffers never leaves cache, so the comparison is against
+a rate the step never has to sustain.
+
+Two measurements say what is really going on. Replacing the collision with the
+identity, so the kernel only propagates and writes, makes it **2.2 to 2.5 times
+faster** at every size that fits in cache. And throughput *rises* with the
+lattice --- 61 Gcell/s at 1024x1024, 79 at the production size, 81 at
+2048x2048, 93 at 4096x2048 --- which is a kernel wanting more threads to hide
+latency behind, not one starved of bandwidth.
+
+Only the largest lattices are memory-bound. At 8192x5120 the buffers are 73 MB,
+the step takes 0.587 ms, and that is 134 GB/s: the streaming rate, to within
+the error on it.
+
+So at the sizes a run actually uses, the step is **compute-bound**, and the
+685-operator collision circuit is the cost. Its *shape* is not, though ---
+emitting each state's minterm standalone instead of sharing a prefix tree
+measures the same to half a percent, because the Metal compiler finds the
+sharing either way. That is the same negative result LLVM gave on the CPU.
 
 On `--no-gpu` the same table reads 74 s for `Lattice::step`, 1.5 s for
 `Field::sample` and 6.1 s for the startup measurement, and the run takes 1.4
@@ -197,6 +215,13 @@ in for the size-256 measurement the binary actually does; the real one is
 
 ## Reading the results
 
+`step/gpu/2048x1280/one-per-submit` is the noisiest case in the suite and the
+one to distrust: it submits a single small dispatch and waits, so it is almost
+all submission latency, and it lands bimodally at either about 158 or about 191
+us depending on what power state the GPU is in. Both readings are reproducible
+several times in a row. Take a flag on that case as a hint about the machine
+rather than about the code.
+
 Run-to-run noise on this machine is around 1% for the single-threaded cases,
 2-3% for the multi-threaded ones, and around 10% for `step/2048x64/tN`, which
 gives twelve threads only five rows each and so is almost pure thread-scoping
@@ -217,33 +242,34 @@ per-step figure.
 
 | Case | Time | Throughput |
 | --- | ---: | ---: |
-| `step/512x512/t1` | 569.28 us | 460.5 Mcell/s |
-| `step/512x512/tN` | 174.18 us | 1505.0 Mcell/s |
-| `step/512x512/t1/no-rest` | 567.04 us | 462.3 Mcell/s |
-| `step/512x512/tN/plate` | 174.04 us | 1506.2 Mcell/s |
-| `step/512x512/tN/inlet` | 201.11 us | 1303.5 Mcell/s |
-| `step/2048x1280/t1` | 10.562 ms | 248.2 Mcell/s |
-| `step/2048x1280/tN` | 1.411 ms | 1857.9 Mcell/s |
-| `step/2048x64/tN` | 122.13 us | 1073.2 Mcell/s |
-| `step/gpu/2048x1280/one-per-submit` | 158.49 us | 16540.6 Mcell/s |
-| `step/gpu/2048x1280/batched` | 3.303 ms | 79366.4 Mcell/s |
-| `step/gpu/256x256/batched` | 681.26 us | 9619.8 Mcell/s |
-| `step/gpu/2048x1280/batched+inlet` | 3.433 ms | 76353.7 Mcell/s |
-| `step/gpu/2048x1280/batched+inlet+sample` | 3.702 ms | 70815.7 Mcell/s |
-| `field/gpu/sample/2048x1280` | 128.72 us | 20366.2 Mcell/s |
-| `lattice/gpu/store/2048x1280` | 1.004 ms | 2610.9 Mcell/s |
-| `lattice/gpu/total-particles/2048x1280` | 151.97 us | 17250.2 Mcell/s |
-| `field/sample/2048x1280` | 173.83 us | 15080.6 Mcell/s |
-| `field/vorticity/2048x1280` | 8.93 us |  |
-| `field/mean-velocity/2048x1280` | 4.51 us |  |
-| `lattice/total-particles/2048x1280` | 44.57 us | 58811.2 Mcell/s |
-| `lattice/mean-velocity/2048x1280` | 501.12 us | 5231.2 Mcell/s |
-| `render/write-vorticity/png` | 6.505 ms | 56.2 Mpx/s |
-| `render/write-arrows/svg` | 2.984 ms |  |
-| `collision/build/rest` | 7.06 us |  |
+| `step/512x512/t1` | 571.55 us | 458.7 Mcell/s |
+| `step/512x512/tN` | 174.12 us | 1505.6 Mcell/s |
+| `step/512x512/t1/no-rest` | 565.83 us | 463.3 Mcell/s |
+| `step/512x512/tN/plate` | 174.43 us | 1502.8 Mcell/s |
+| `step/512x512/tN/inlet` | 203.07 us | 1290.9 Mcell/s |
+| `step/2048x1280/t1` | 10.552 ms | 248.4 Mcell/s |
+| `step/2048x1280/tN` | 1.422 ms | 1844.0 Mcell/s |
+| `step/2048x64/tN` | 123.46 us | 1061.7 Mcell/s |
+| `step/gpu/2048x1280/one-per-submit` | 157.04 us | 16692.3 Mcell/s |
+| `step/gpu/2048x1280/batched` | 3.308 ms | 79234.4 Mcell/s |
+| `step/gpu/256x256/batched` | 695.05 us | 9428.9 Mcell/s |
+| `step/gpu/4096x2048/batched` | 8.976 ms | 93454.4 Mcell/s |
+| `step/gpu/2048x1280/batched+inlet` | 3.432 ms | 76372.2 Mcell/s |
+| `step/gpu/2048x1280/batched+inlet+sample` | 3.702 ms | 70812.7 Mcell/s |
+| `field/gpu/sample/2048x1280` | 128.09 us | 20465.0 Mcell/s |
+| `lattice/gpu/store/2048x1280` | 1.004 ms | 2611.4 Mcell/s |
+| `lattice/gpu/total-particles/2048x1280` | 148.55 us | 17646.6 Mcell/s |
+| `field/sample/2048x1280` | 170.81 us | 15346.7 Mcell/s |
+| `field/vorticity/2048x1280` | 8.91 us |  |
+| `field/mean-velocity/2048x1280` | 4.75 us |  |
+| `lattice/total-particles/2048x1280` | 44.57 us | 58815.6 Mcell/s |
+| `lattice/mean-velocity/2048x1280` | 501.25 us | 5229.8 Mcell/s |
+| `render/write-vorticity/png` | 6.489 ms | 56.3 Mpx/s |
+| `render/write-arrows/svg` | 2.979 ms |  |
+| `collision/build/rest` | 7.04 us |  |
 | `collision/build/no-rest` | 3.14 us |  |
-| `lattice/init-equilibrium/2048x1280` | 17.237 ms | 152.1 Mcell/s |
-| `transport/measure/64` | 630.525 ms |  |
+| `lattice/init-equilibrium/2048x1280` | 17.225 ms | 152.2 Mcell/s |
+| `transport/measure/64` | 626.022 ms |  |
 
 Numbers taken on a different machine are not comparable to these; re-record the
 baseline before using it, and say in the commit message which machine it came
