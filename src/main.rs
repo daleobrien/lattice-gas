@@ -6,11 +6,13 @@ use lattice_gas::lattice::Lattice;
 use lattice_gas::render::{self, Field};
 use lattice_gas::sim::Sim;
 use lattice_gas::transport;
+use std::io::{IsTerminal, Write};
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 struct Config {
@@ -272,6 +274,131 @@ impl Frames {
     }
 }
 
+/// The per-frame status display: a line of numbers and, unless it is turned
+/// off, the ascii view of the flow.
+///
+/// On a terminal the block is drawn over the previous one, so a long run holds
+/// still on one screenful instead of scrolling a few hundred views past. Piped
+/// to a file or a log, where cursor movement would only leave escape codes
+/// behind, the blocks are printed one after another as they always were.
+struct Progress {
+    in_place: bool,
+    /// Terminal size as (rows, cols), when we could find it out.
+    size: Option<(usize, usize)>,
+    asked: Instant,
+    /// Rows the last block covered, which is how far back up to go.
+    drawn: usize,
+    /// How long the closing summary will be, which decides how many rows to
+    /// hold open for it.
+    summary: usize,
+}
+
+impl Progress {
+    fn new(summary: usize) -> Progress {
+        let in_place = std::io::stdout().is_terminal();
+        Progress {
+            in_place,
+            size: if in_place { terminal_size() } else { None },
+            asked: Instant::now(),
+            drawn: 0,
+            summary,
+        }
+    }
+
+    /// Blank rows to keep below the view: the blank line the summary starts
+    /// with, however many rows the summary itself wraps onto, and the row the
+    /// cursor comes to rest on after it.
+    fn reserved(&self) -> usize {
+        match self.size {
+            Some((_, cols)) => 1 + self.summary.div_ceil(cols.max(1)),
+            None => 2,
+        }
+    }
+
+    /// The size to draw the ascii view at: the 100 x 22 it has always been,
+    /// less whatever it takes to leave the window a step line and the reserved
+    /// rows. Redrawing in place only works while the whole block fits on
+    /// screen, so a small window gets a small view rather than a scrolling one.
+    ///
+    /// This is where a resized window is noticed, one frame ahead of the draw
+    /// that follows it, so the view and the rows held under it agree.
+    fn view(&mut self) -> (usize, usize) {
+        // Ask again every so often rather than every frame, which for a small
+        // `--frame-every` would have us forking `stty` in a loop.
+        if self.in_place && self.asked.elapsed() > Duration::from_secs(2) {
+            self.size = terminal_size();
+            self.asked = Instant::now();
+        }
+        match self.size {
+            Some((rows, cols)) => (
+                cols.saturating_sub(1).min(100),
+                rows.saturating_sub(self.reserved() + 2).min(22),
+            ),
+            None => (100, 22),
+        }
+    }
+
+    fn draw(&mut self, mut block: String) {
+        if !block.ends_with('\n') {
+            block.push('\n');
+        }
+        let mut out = std::io::stdout().lock();
+        if !self.in_place {
+            let _ = out.write_all(block.as_bytes());
+            let _ = out.flush();
+            return;
+        }
+
+        if let Some((_, cols)) = self.size {
+            block = clip(&block, cols);
+        }
+        if self.drawn > 0 {
+            // Back to the top of the last block, then clear to the bottom of
+            // the screen so a shorter block leaves no tail behind.
+            let _ = write!(out, "\x1b[{}A\x1b[J", self.drawn);
+        }
+        self.drawn = block.bytes().filter(|b| *b == b'\n').count();
+        let _ = out.write_all(block.as_bytes());
+        // Take the rows the closing summary will need now, while the view can
+        // still be redrawn, and step back over them. Printing those two lines
+        // at the end then costs no scrolling, so the last view stays where the
+        // run left it instead of sliding up out of place.
+        let reserved = self.reserved();
+        let _ = write!(out, "{}\x1b[{reserved}A", "\n".repeat(reserved));
+        let _ = out.flush();
+    }
+}
+
+/// Cut every line to the width of the window. A line that runs past the right
+/// margin wraps onto a second row, and the redraw counts rows, not lines.
+fn clip(block: &str, cols: usize) -> String {
+    let mut out = String::with_capacity(block.len());
+    for line in block.lines() {
+        out.extend(line.chars().take(cols));
+        out.push('\n');
+    }
+    out
+}
+
+/// Ask the terminal how big it is, as (rows, cols). The standard library has
+/// no way to, so this asks `stty`, which reads its input: hand it our own
+/// output, which is the terminal we are drawing on. /dev/tty would be the
+/// obvious thing to give it and is the wrong one, being whatever terminal
+/// started us rather than wherever stdout now goes.
+fn terminal_size() -> Option<(usize, usize)> {
+    let screen = std::io::stdout().as_fd().try_clone_to_owned().ok()?;
+    let out = std::process::Command::new("stty")
+        .arg("size")
+        .stdin(std::process::Stdio::from(screen))
+        .output()
+        .ok()?;
+    let text = std::str::from_utf8(&out.stdout).ok()?;
+    let mut n = text.split_whitespace();
+    let rows: usize = n.next()?.parse().ok()?;
+    let cols: usize = n.next()?.parse().ok()?;
+    (rows > 0 && cols > 0).then_some((rows, cols))
+}
+
 fn threads(c: &Config) -> usize {
     if c.threads > 0 {
         c.threads
@@ -408,9 +535,30 @@ fn run(c: Config) {
     }
     sim.sample(&mut field, 1.0);
 
+    // The line the run closes with. Writing it here as well as at the end
+    // gives the display something to measure, so it can hold that many rows
+    // open under the view and the summary can land without pushing it up.
+    let summary = |secs: f64, rate: f64, frames: u64, mass1: u64| {
+        format!(
+            "done in {secs:.1}s at {rate:.0}M cell-updates/s. {frames} frames in {}. \
+             particle count {mass0} -> {mass1} ({}).",
+            c.out.display(),
+            if mass0 == mass1 {
+                "exactly conserved"
+            } else {
+                "changed at the inflow boundary, as expected"
+            }
+        )
+    };
+
     // Four writers cover a `--frame-every` down to about 100 steps; past that
     // the run waits on them, which is the right way round.
     let frames = Frames::new(nth.clamp(1, 4));
+    // Times and rates no run will exceed, so the measurement is an upper bound
+    // on the real one and the view never ends up a row short.
+    let mut progress = Progress::new(
+        summary(9999.9, 99999.0, c.steps.div_ceil(c.frame_every), mass0 + 1).len(),
+    );
     let mut frame = 0usize;
     let mut step = 0u64;
     while step < c.steps {
@@ -427,7 +575,7 @@ fn run(c: Config) {
         let svg = c.out.join(format!("arrows-{frame:04}.svg"));
         if let Err(e) = frames.write(Frame {
             field: field.clone(),
-            png: png.clone(),
+            png,
             svg,
             scale: c.scale,
             arrow_scale: c.arrow_scale,
@@ -438,22 +586,15 @@ fn run(c: Config) {
         }
 
         if !c.quiet {
-            let rate = (c.width * c.height) as f64 * step as f64
-                / start.elapsed().as_secs_f64()
-                / 1e6;
-            let cells_per = if c.rest_particles { 7.0 } else { 6.0 };
-            println!(
-                "step {step:>7}/{}  mean u = ({:+.3}, {:+.3})  density = {:.3}/dir  \
-                 {rate:.0}M cell-updates/s  -> {}",
-                c.steps,
-                mean.0,
-                mean.1,
-                sim.total_particles() as f32 / (c.width * c.height) as f32 / cells_per,
-                png.display()
-            );
+            // Padded to the width of the total, so the count does not shuffle
+            // sideways as it grows under a view that no longer scrolls away.
+            let digits = c.steps.to_string().len();
+            let (cols, rows) = progress.view();
+            let mut block = format!("step {step:>digits$}/{}\n", c.steps);
             if c.preview {
-                print!("{}", render::ascii_preview(&field, 100, 22));
+                block.push_str(&render::ascii_preview(&field, cols, rows));
             }
+            progress.draw(block);
         }
         frame += 1;
     }
@@ -464,17 +605,8 @@ fn run(c: Config) {
         std::process::exit(1);
     }
     if !c.quiet {
-        println!(
-            "\ndone in {:.1}s. {frame} frames in {}. particle count {} -> {} ({}).",
-            start.elapsed().as_secs_f32(),
-            c.out.display(),
-            mass0,
-            mass1,
-            if mass0 == mass1 {
-                "exactly conserved"
-            } else {
-                "changed at the inflow boundary, as expected"
-            }
-        );
+        let secs = start.elapsed().as_secs_f64();
+        let rate = (c.width * c.height) as f64 * c.steps as f64 / secs / 1e6;
+        println!("\n{}", summary(secs, rate, frame as u64, mass1));
     }
 }
