@@ -52,12 +52,12 @@ enum Obstacle {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            width: 2048,
-            height: 1280,
+            width: 6144,
+            height: 1536,
             density: 0.22,
             speed: 0.4,
-            steps: 40_000,
-            warmup: 6_000,
+            steps: 50_000,
+            warmup: 8_000,
             obstacle: Obstacle::Plate,
             obstacle_x: 0.0, // filled in as width/5
             size: 173.0,
@@ -83,15 +83,17 @@ impl Default for Config {
 const USAGE: &str = "\
 lgca -- hexagonal lattice-gas fluid (NKS pp. 378-380)
 
-The defaults run flow past a plate at a Reynolds number near 100: 2.6 million
-cells in about 8 MB, a few minutes of wall time.
+The defaults run flow past a plate at a Reynolds number near 100: 9.4 million
+cells in about 30 MB, long enough downstream to hold a dozen vortices. That is
+some seconds on a GPU and some minutes on a CPU; --width and --steps are what
+to cut if it is the latter.
 
-  --width N            lattice columns              (default 2048)
-  --height N           lattice rows, must be even   (default 1280)
+  --width N            lattice columns              (default 6144)
+  --height N           lattice rows, must be even   (default 1536)
   --density F          occupancy per direction      (default 0.22)
   --speed F            inflow speed, 0..1           (default 0.4)
-  --steps N            update steps                 (default 40000)
-  --warmup N           steps before recording       (default 6000)
+  --steps N            update steps                 (default 50000)
+  --warmup N           steps before recording       (default 8000)
   --obstacle KIND      plate | cylinder | none      (default plate)
   --size F             plate length or diameter     (default 173)
   --obstacle-x F       obstacle position in x       (default width/5)
@@ -319,14 +321,14 @@ impl Progress {
         }
     }
 
-    /// The size to draw the ascii view at: the 100 x 22 it has always been,
-    /// less whatever it takes to leave the window a step line and the reserved
-    /// rows. Redrawing in place only works while the whole block fits on
-    /// screen, so a small window gets a small view rather than a scrolling one.
+    /// The room the display has to draw in, as (cols, rows): the whole window,
+    /// less whatever it takes to leave the step line and the reserved rows
+    /// below it. Redrawing in place only works while the block fits on screen,
+    /// so a small window gets a small view rather than a scrolling one.
     ///
     /// This is where a resized window is noticed, one frame ahead of the draw
     /// that follows it, so the view and the rows held under it agree.
-    fn view(&mut self) -> (usize, usize) {
+    fn room(&mut self) -> (usize, usize) {
         // Ask again every so often rather than every frame, which for a small
         // `--frame-every` would have us forking `stty` in a loop.
         if self.in_place && self.asked.elapsed() > Duration::from_secs(2) {
@@ -335,10 +337,12 @@ impl Progress {
         }
         match self.size {
             Some((rows, cols)) => (
-                cols.saturating_sub(1).min(100),
-                rows.saturating_sub(self.reserved() + 2).min(22),
+                cols.saturating_sub(1),
+                rows.saturating_sub(self.reserved() + 2),
             ),
-            None => (100, 22),
+            // Not a terminal, so nothing is redrawn and nothing has to fit;
+            // a width a piped log can hold is all this has to be.
+            None => (100, 34),
         }
     }
 
@@ -687,10 +691,16 @@ fn run(c: Config) {
         }
 
         if !c.quiet {
-            let (cols, rows) = progress.view();
+            let (mut cols, rows) = progress.room();
             let mut block = String::new();
             if c.preview {
-                block.push_str(&render::preview(&field, cols, rows, c.colour));
+                // The bar is drawn to the width of the view above it rather
+                // than the window's, so the two line up.
+                let fitted = render::preview_size(&field, cols, rows, c.colour);
+                if fitted.0 > 0 {
+                    cols = fitted.0;
+                }
+                block.push_str(&render::preview(&field, fitted.0, fitted.1, c.colour));
             }
             block.push_str(&bar(step, c.steps, cols));
             progress.draw(block);

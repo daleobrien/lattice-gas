@@ -266,6 +266,36 @@ pub fn write_arrows(path: &Path, f: &Field, scale: f32, frame: (f32, f32)) -> st
     std::fs::write(path, s)
 }
 
+/// The size to draw the terminal view at, in character cells, fitted into a
+/// window `cols` x `rows` in size.
+///
+/// Two things bound it. The lattice has an aspect ratio --- it is `bw * bx`
+/// wide and `bh * by * SQRT3_2` tall --- and stretching the flow to fill a
+/// window would be a lie about the geometry. And the block grid is all the
+/// detail there is, so a view wider than `bw` only doubles up columns and
+/// comes out looking coarser than the one that fits.
+///
+/// In colour a character cell holds two square sub-rows; without it one row,
+/// on a cell about twice as tall as it is wide. Either way a row covers two
+/// units of height per unit of width, which is why the same arithmetic serves
+/// both.
+pub fn preview_size(f: &Field, cols: usize, rows: usize, colour: bool) -> (usize, usize) {
+    if cols == 0 || rows == 0 || f.bw == 0 || f.bh == 0 {
+        return (0, 0);
+    }
+    let tall = f.bh as f32 * f.by as f32 * SQRT3_2 / (f.bw as f32 * f.bx as f32);
+    let deep = if colour { f.bh.div_ceil(2) } else { f.bh };
+    let mut c = cols.min(f.bw);
+    let mut r = ((c as f32 * tall / 2.0).round() as usize).clamp(1, deep);
+    if r > rows {
+        // Too tall for the window, so the height is what is really available
+        // and the width comes back to match it.
+        r = rows;
+        c = (((r * 2) as f32 / tall).round() as usize).clamp(1, cols.min(f.bw));
+    }
+    (c, r)
+}
+
 /// Terminal view of the vorticity, for watching a run without leaving the
 /// shell.
 ///

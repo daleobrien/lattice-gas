@@ -13,9 +13,9 @@ Karman vortex street.
 
 ![Vorticity in the wake of a plate](docs/vortex-street.png)
 
-*Vorticity after 36,000 steps on a 2048 x 1280 lattice, at a Reynolds number
-near 100. Blue and red are the two senses of rotation; the black bar is the
-plate.*
+*Vorticity after 40,000 steps of the default run: a 6144 x 1536 lattice at a
+Reynolds number near 100, long enough downstream to hold a dozen vortices. Blue
+and red are the two senses of rotation; the black bar is the plate.*
 
 ## Build and run
 
@@ -27,9 +27,13 @@ cargo build --release
 ./target/release/lgca
 ```
 
-The defaults are chosen to reproduce the book's picture on a laptop: 2048 x
-1280 cells, a plate 173 cells across, Reynolds number near 100. That is 2.6
-million cells in about 8 MB, and under two seconds on an M3 Pro.
+The defaults are chosen to reproduce the book's picture on a laptop: 6144 x
+1536 cells, a plate 173 cells across, Reynolds number near 100. That is 9.4
+million cells in about 30 MB, and some nine seconds on an M3 Pro. The lattice
+is far wider than it is tall because a vortex street is: the wake needs room to
+shed a dozen vortices before it runs off the end. On a machine with no GPU the
+same run is minutes rather than seconds, and `--width 2048 --steps 20000` is
+the thing to reach for.
 
 On macOS the update runs on the GPU by default, as bitplanes -- one bit per
 cell per direction, 32 cells to a word, so a collision is Boolean algebra
@@ -45,8 +49,8 @@ with the mean flow subtracted so the fluid is at rest and the obstacle moves.
 
 ![Velocity arrows](docs/velocity-arrows.svg)
 
-*The same instant as an arrow plot. With the mean flow subtracted the plate is
-the thing that is moving, which is how the book presents it.*
+*A shorter 2048 x 1280 run as an arrow plot. With the mean flow subtracted the
+plate is the thing that is moving, which is how the book presents it.*
 
 `--alpha` defaults to `--sample-every / 25`, which holds the running time
 average over a fixed 25 steps however often the field is sampled. That matters

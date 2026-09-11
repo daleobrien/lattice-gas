@@ -69,9 +69,9 @@ what it is -- a busy machine -- rather than being folded into the result.
 ## Where the time actually goes
 
 The point of the suite is not the individual numbers but the budget they add
-up to. For the default run -- 2048x1280 cells, 6,000 warmup steps then 40,000
-recorded ones, a field sample every 5 steps, a frame every 500 -- the measured
-per-call costs predict this:
+up to. For a 2048x1280 run -- 6,000 warmup steps then 40,000 recorded ones, a
+field sample every 5 steps, a frame every 500 -- the measured per-call costs
+predict this:
 
 | Phase | Calls | Each | Total | Share |
 | --- | ---: | ---: | ---: | ---: |
@@ -79,6 +79,11 @@ per-call costs predict this:
 | `transport::measure` at startup | 1 | 0.30 s | 0.30 s | 14% |
 | `init_equilibrium` and setup | 1 | 0.11 s | 0.11 s | 5% |
 | Writing frames (PNG + SVG) | 80 | 9.5 ms | 0.76 s | *overlapped* |
+
+The defaults have since grown to 6144x1536 and 50,000 steps, which multiplies
+only the first row: the startup and setup costs are the same wall clock however
+big the lattice is, so on the default run they fall from a fifth of the time to
+about a twentieth.
 
 The step figure is `step/gpu/2048x1280/batched+inlet+sample`, which is the
 production configuration: the inflow boundary and a field sample every fifth
@@ -217,8 +222,8 @@ Gcell/s; `Field::sample` and `Lattice::mean_velocity` look each cell byte up in
 the packed-moment tables in `src/moments.rs` and reach 15.0 and 5.1 Gcell/s.
 They used to take the cell apart a bit at a time on a single thread, at 116 and
 114 Mcell/s, and the 500x gap between those and `total_particles` was the whole
-story of this section. Closing it is most of what took the default run from 4.7
-minutes to 1.4. (`field/vorticity` and `field/mean-velocity` work on the 102x64
+story of this section. Closing it is most of what took the 2048x1280 run from
+4.7 minutes to 1.4. (`field/vorticity` and `field/mean-velocity` work on the 102x64
 block grid rather than the lattice, which is why they are microseconds.)
 
 **`render/*`** -- the hand-rolled PNG and SVG encoders. Both are small
