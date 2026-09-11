@@ -8,6 +8,7 @@
 use crate::hex::SQRT3_2;
 use crate::lattice::Lattice;
 use crate::moments;
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// A block counts as obstacle for display purposes above this solid fraction.
@@ -265,28 +266,147 @@ pub fn write_arrows(path: &Path, f: &Field, scale: f32, frame: (f32, f32)) -> st
     std::fs::write(path, s)
 }
 
-/// Rough terminal view of the vorticity, for watching a run without leaving
-/// the shell.
-pub fn ascii_preview(f: &Field, cols: usize, rows: usize) -> String {
+/// Terminal view of the vorticity, for watching a run without leaving the
+/// shell.
+///
+/// Two sub-rows are packed into every character cell: an upper half block,
+/// `\u{2580}`, painted in the colour of the row above sits on a background in
+/// the colour of the row below. That buys the view twice the vertical
+/// resolution for the same number of terminal rows, and puts the pixels at
+/// roughly square aspect instead of the two-to-one a character cell has.
+///
+/// Colour carries the sign the way the PNGs do --- one rotation blue, the
+/// other red --- which is what makes a vortex street read as a street rather
+/// than a row of blobs. Without colour the same sampling is drawn with the
+/// block-element shades, which lose the sign but ramp far more evenly than
+/// punctuation ever did.
+pub fn preview(f: &Field, cols: usize, rows: usize, colour: bool) -> String {
+    if cols == 0 || rows == 0 || f.bw == 0 || f.bh == 0 {
+        return String::new();
+    }
     let vort = f.vorticity();
+    // Scale to the strongest vorticity in the fluid; the obstacle's own edge
+    // is excluded, being a discontinuity rather than a feature of the flow.
     let mut peak = 1e-9f32;
     for (k, v) in vort.iter().enumerate() {
         if f.solid[k] < SOLID {
             peak = peak.max(v.abs());
         }
     }
-    let ramp = [' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
-    let mut out = String::new();
+    if colour {
+        colour_preview(f, &vort, peak, cols, rows)
+    } else {
+        shaded_preview(f, &vort, peak, cols, rows)
+    }
+}
+
+/// The block holding sub-row `s` of `sub` and column `c` of `cols`, nearest
+/// neighbour. Row 0 is the top of the view and the top of the lattice.
+fn sample(f: &Field, c: usize, cols: usize, s: usize, sub: usize) -> usize {
+    let i = (c * f.bw / cols).min(f.bw - 1);
+    let j = f.bh - 1 - (s * f.bh / sub).min(f.bh - 1);
+    j * f.bw + i
+}
+
+/// Vorticity mapped to -1..1, with a gamma that lifts the mid-tones. The peak
+/// is a single cell somewhere; left linear, everything else sits in the bottom
+/// of the ramp and the view comes out nearly blank.
+fn shade(v: f32, peak: f32) -> f32 {
+    let t = (v / peak).clamp(-1.0, 1.0);
+    // A lattice gas is noisy by construction, and a tenth of the peak is about
+    // what the residual fluctuation reaches. Cutting that away first keeps the
+    // speckle dim and leaves the whole ramp for the flow.
+    const FLOOR: f32 = 0.10;
+    (((t.abs() - FLOOR).max(0.0) / (1.0 - FLOOR)).powf(0.7)).copysign(t)
+}
+
+fn colour_preview(f: &Field, vort: &[f32], peak: f32, cols: usize, rows: usize) -> String {
+    let sub = rows * 2;
+    let mut out = String::with_capacity(rows * cols * 20);
     for r in 0..rows {
-        let j = f.bh - 1 - r * f.bh / rows;
+        // Colours are only re-stated when they change, which for the flat
+        // stretches of a field cuts the escape codes --- and so the bytes the
+        // terminal has to chew through each frame --- by most of themselves.
+        let mut last: Option<(u8, u8)> = None;
         for c in 0..cols {
-            let i = (c * f.bw / cols).min(f.bw - 1);
-            let k = j * f.bw + i;
+            let top = terminal_colour(f, vort, peak, sample(f, c, cols, r * 2, sub));
+            let bot = terminal_colour(f, vort, peak, sample(f, c, cols, r * 2 + 1, sub));
+            match last {
+                Some((t, b)) if t == top && b == bot => {}
+                Some((t, _)) if t == top => {
+                    let _ = write!(out, "\x1b[48;5;{bot}m");
+                }
+                Some((_, b)) if b == bot => {
+                    let _ = write!(out, "\x1b[38;5;{top}m");
+                }
+                _ => {
+                    let _ = write!(out, "\x1b[38;5;{top};48;5;{bot}m");
+                }
+            }
+            last = Some((top, bot));
+            out.push('\u{2580}');
+        }
+        out.push_str("\x1b[0m\n");
+    }
+    out
+}
+
+/// One block as a 256-colour index: the obstacle in grey, the fluid on the
+/// same diverging scale the vorticity PNGs use, but running out of black so
+/// that still water is the terminal's own background rather than a wall of
+/// white.
+fn terminal_colour(f: &Field, vort: &[f32], peak: f32, k: usize) -> u8 {
+    if f.solid[k] > SOLID {
+        return 244;
+    }
+    let m = shade(vort[k], peak);
+    // Six levels a channel is not much, so hue does the work colour depth
+    // cannot: each sign climbs black -> saturated -> bright -> near-white,
+    // which reads as a gradient where a single channel would flatten out at
+    // the top of its ramp.
+    let (a, b, c) = (
+        (m.abs() * 2.2).min(1.0),
+        ((m.abs() - 0.45) / 0.55).clamp(0.0, 1.0),
+        ((m.abs() - 0.80) / 0.20).clamp(0.0, 1.0) * 0.7,
+    );
+    if m >= 0.0 {
+        cube(a, b * 0.95, c)
+    } else {
+        cube(c, b * 0.9, a)
+    }
+}
+
+/// Nearest entry of xterm's 6x6x6 colour cube. 256 colours rather than 24-bit
+/// because plenty of terminals in daily use --- Terminal.app among them ---
+/// have no truecolor, and a field of vorticity has no need of more than 216
+/// shades anyway.
+fn cube(r: f32, g: f32, b: f32) -> u8 {
+    // The cube's levels are not evenly spaced: 0, then 95 and 40 apart after.
+    fn level(v: f32) -> u8 {
+        let v = (v.clamp(0.0, 1.0) * 255.0).round();
+        if v < 48.0 {
+            0
+        } else {
+            (((v - 55.0) / 40.0).round().clamp(1.0, 5.0)) as u8
+        }
+    }
+    16 + 36 * level(r) + 6 * level(g) + level(b)
+}
+
+/// The colourless view: block-element shades by magnitude, and a hatch for the
+/// obstacle so it reads as a wall rather than as the strongest vorticity on
+/// screen.
+fn shaded_preview(f: &Field, vort: &[f32], peak: f32, cols: usize, rows: usize) -> String {
+    let ramp = [' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{2588}'];
+    let mut out = String::with_capacity(rows * (cols + 1) * 3);
+    for r in 0..rows {
+        for c in 0..cols {
+            let k = sample(f, c, cols, r, rows);
             if f.solid[k] > SOLID {
-                out.push('8');
+                out.push('\u{259e}');
             } else {
-                let t = (vort[k].abs() / peak * (ramp.len() - 1) as f32) as usize;
-                out.push(ramp[t.min(ramp.len() - 1)]);
+                let t = shade(vort[k], peak).abs() * (ramp.len() - 1) as f32;
+                out.push(ramp[(t as usize).min(ramp.len() - 1)]);
             }
         }
         out.push('\n');

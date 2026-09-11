@@ -39,6 +39,7 @@ struct Config {
     nu: Option<f32>,
     quiet: bool,
     preview: bool,
+    colour: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -74,6 +75,7 @@ impl Default for Config {
             nu: None,
             quiet: false,
             preview: true,
+            colour: colour_terminal(),
         }
     }
 }
@@ -109,6 +111,7 @@ cells in about 8 MB, a few minutes of wall time.
   --measure            measure viscosity and advection factor, then exit
   --scan-density       measure transport coefficients across densities, then exit
   --no-preview         do not print the terminal view
+  --no-colour          draw the view in shades, not colour
   --quiet              only print the summary
   -h, --help
 ";
@@ -161,6 +164,7 @@ fn parse_args() -> Result<(Config, Mode), String> {
             "--measure" | "--measure-viscosity" => mode = Mode::Measure,
             "--scan-density" => mode = Mode::ScanDensity,
             "--no-preview" => c.preview = false,
+            "--no-colour" | "--no-color" => c.colour = false,
             "--quiet" => {
                 c.quiet = true;
                 c.preview = false;
@@ -396,8 +400,17 @@ fn bar(step: u64, steps: u64, cols: usize) -> String {
     let count = format!("{:>3}%  step {step:>digits$}/{steps}", 100 * step / steps.max(1));
     // Whatever the brackets and the count beside them leave.
     let width = cols.saturating_sub(count.len() + 4);
-    let filled = (width as u64 * step / steps.max(1)) as usize;
-    format!("[{}{}]  {count}\n", "#".repeat(filled), ".".repeat(width - filled))
+    // An eighth of a character of resolution past the whole cells, so a slow
+    // run's bar creeps rather than sitting still between jumps.
+    let eighths = (width as u64 * 8 * step / steps.max(1)) as usize;
+    let (filled, part) = (eighths / 8, eighths % 8);
+    let mut track = "\u{2588}".repeat(filled);
+    if part > 0 {
+        // U+2588 FULL BLOCK back down to U+258F LEFT ONE EIGHTH BLOCK.
+        track.push(char::from_u32(0x2590 - part as u32).unwrap());
+    }
+    let rest = width - filled - usize::from(part > 0);
+    format!("\u{2502}{track}{}\u{2502}  {count}\n", "\u{2591}".repeat(rest))
 }
 
 /// Cut every line to the width of the window. A line that runs past the right
@@ -405,10 +418,50 @@ fn bar(step: u64, steps: u64, cols: usize) -> String {
 fn clip(block: &str, cols: usize) -> String {
     let mut out = String::with_capacity(block.len());
     for line in block.lines() {
-        out.extend(line.chars().take(cols));
+        let mut width = 0;
+        let mut styled = false;
+        let mut cut = false;
+        let mut chars = line.chars();
+        while let Some(ch) = chars.next() {
+            // An escape sequence occupies no columns, so it is copied through
+            // whole and not counted. Cutting one in half would leave the
+            // terminal reading the tail of it as text.
+            if ch == '\x1b' {
+                styled = true;
+                out.push(ch);
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if !matches!(c, '[' | '0'..='9' | ';' | '?') {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if width == cols {
+                cut = true;
+                break;
+            }
+            out.push(ch);
+            width += 1;
+        }
+        // A line cut short loses the reset it ended with, and the colour it
+        // was drawn in would run on down the rest of the screen.
+        if cut && styled {
+            out.push_str("\x1b[0m");
+        }
         out.push('\n');
     }
     out
+}
+
+/// Whether to colour the view: only on a terminal, and not one that has asked
+/// us not to. The view uses the 256-colour palette rather than 24-bit, so a
+/// terminal old enough to want `NO_COLOR` is the only one that needs the
+/// shaded fallback.
+fn colour_terminal() -> bool {
+    std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").map_or(true, |t| t != "dumb")
 }
 
 /// Ask the terminal how big it is, as (rows, cols). The standard library has
@@ -637,7 +690,7 @@ fn run(c: Config) {
             let (cols, rows) = progress.view();
             let mut block = String::new();
             if c.preview {
-                block.push_str(&render::ascii_preview(&field, cols, rows));
+                block.push_str(&render::preview(&field, cols, rows, c.colour));
             }
             block.push_str(&bar(step, c.steps, cols));
             progress.draw(block);
