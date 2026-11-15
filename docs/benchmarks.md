@@ -1,8 +1,8 @@
 # Benchmarks
 
-A dependency-free benchmark suite lives in [`benches/speed.rs`](benches/speed.rs),
+A dependency-free benchmark suite lives in [`benches/speed.rs`](../benches/speed.rs),
 and the numbers it produced on the machine it was written on are recorded in
-[`benches/baseline.txt`](benches/baseline.txt). `cargo bench` reads that file
+[`benches/baseline.txt`](../benches/baseline.txt). `cargo bench` reads that file
 and reports the change against it, so the loop for a performance change is:
 
 ```bash

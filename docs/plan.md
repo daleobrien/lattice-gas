@@ -1,6 +1,6 @@
 # Making it faster
 
-Measured on the machine in [`benches/baseline.txt`](benches/baseline.txt) --- Apple
+Measured on the machine in [`benches/baseline.txt`](../benches/baseline.txt) --- Apple
 M3 Pro, 12 CPU cores (6 performance + 6 efficiency), 18 GPU cores, 150 GB/s of
 unified memory. Every number below is a measurement, either from
 `cargo bench` or from a throwaway prototype written to settle one question.
@@ -22,7 +22,7 @@ possible rather than for making this run quicker).
 
 ## Where the time goes
 
-The budget in [`BENCHMARKS.md`](BENCHMARKS.md) reproduces: for the default run,
+The budget in [`BENCHMARKS.md`](benchmarks.md) reproduces: for the default run,
 4.7 minutes of wall time, spent like this.
 
 | Phase | Calls | Each | Total | Share |
@@ -56,7 +56,7 @@ thread, while also streaming a second 2.6 MB `Vec<bool>` for the solid flag.
 3. **Thread it over block rows.** There are 64 of them at the default block size.
 
 The same table serves `Lattice::mean_velocity` and `row_ux` / `column_uy` in
-[`src/transport.rs`](src/transport.rs). The 16-bit fields cap the block area at
+[`src/transport.rs`](../src/transport.rs). The 16-bit fields cap the block area at
 8,191 cells; the default is 400.
 
 ### What it did
@@ -143,7 +143,7 @@ byte-per-cell kernel is compute-bound and 12 threads beat 6 (1.58 ms against
 (0.108 ms against 0.113 ms), because the efficiency cores add no bandwidth.
 
 **The acceptance test already exists.** The golden checksums *will* move, which
-[`BENCHMARKS.md`](BENCHMARKS.md) already licenses. What must not move is the
+[`BENCHMARKS.md`](benchmarks.md) already licenses. What must not move is the
 physics: `transport::measure` has to keep reporting nu = 0.2989 and g = 0.440
 within noise. That is a quantitative check on a rewrite that changes every
 random draw in the program. Keep the byte kernel as the reference
@@ -200,13 +200,13 @@ above: same rule, 3.4x on twelve cores against 45x on the GPU.
 
 ### Landed
 
-* [`src/metal.rs`](src/metal.rs) --- a hand-rolled Metal binding. Metal has no C
+* [`src/metal.rs`](../src/metal.rs) --- a hand-rolled Metal binding. Metal has no C
   API, but `objc_msgSend` is an ordinary C symbol, so the whole thing is a few
   typed casts of it. `Cargo.lock` is still empty. Buffers are shared rather
   than private, which on Apple silicon means the CPU and GPU address one
   allocation and the analysis passes need no transfer --- and it measures the
   same as private storage.
-* [`src/gpu.rs`](src/gpu.rs) --- the lattice as bitplanes, 32 cells to a `uint`,
+* [`src/gpu.rs`](../src/gpu.rs) --- the lattice as bitplanes, 32 cells to a `uint`,
   seven planes plus a solid plane that sits outside the ping-pong because it
   never changes. Propagation is a shift with a carry from the neighbouring
   word, plus a fix-up for the one bit per row that wraps, so widths that are
@@ -292,7 +292,7 @@ still ran on the CPU. Four things closed that gap.
 * **`total_particles` is a GPU kernel** (`lgca_count`), so the status line does
   not force the planes to be unpacked every frame.
 * **`transport::measure` runs on whichever backend the run will use**, through
-  a new `Sim` in [`src/sim.rs`](src/sim.rs) that both it and `main.rs` drive.
+  a new `Sim` in [`src/sim.rs`](../src/sim.rs) that both it and `main.rs` drive.
   It was 7% of the old run and would have been 65% of the new one. 6.1 s to
   0.7 s, and the two agree: `nu` 0.2989 against 0.3080, `g` 0.4405 against
   0.4361.
@@ -432,7 +432,7 @@ Measured, and recorded here so the question does not have to be asked again.
   there.
 * **The collision table is not the bottleneck.** The six-direction table (384
   bytes) and the FHP-III table (3,840 bytes) run at the same speed, as
-  [`BENCHMARKS.md`](BENCHMARKS.md) already suspected.
+  [`BENCHMARKS.md`](benchmarks.md) already suspected.
 
 ## Where it ended up
 
